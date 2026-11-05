@@ -2,10 +2,15 @@
 //! 1. 环境变量 `DDHOTAPPLY_DLL`（显式覆盖，路径写错也会继续向下回退）
 //! 2. `exe目录/DdHotapply.dll`（随 T5 程序部署的标准位置）
 //! 3. `exe目录/eng/native/DdHotapply.dll`（旧 C# 工具的布局兼容）
-//! 4. `crates/hotapply/bin/DdHotapply.dll`（本仓库提交的预编译副本，开发态）
-//! 5. `<repo>/Gui/eng/native/DdHotapply.dll`（native/build.ps1 的产物目录，开发态）
+//!    （2、3 都是 exe 目录树内受管位：内容与嵌入副本不一致时自动覆盖为
+//!    嵌入版 —— 防旧部署/旧工具布局残留漂移，见 refresh_if_stale）
+//! 4. `crates/hotapply/bin/DdHotapply.dll`（native/build.ps1 的产物，开发态）
+//! 5. `<repo>/Gui/eng/native/DdHotapply.dll`（旧布局兼容，开发态）
+//! 6. 内嵌副本兜底：build.rs 在编译期把 DLL 嵌进 exe（见 build.rs），
+//!    前 5 项全未命中（部署机场景）时解压到 exe 目录；目录只读则退
+//!    `%TEMP%\DdModToolHotapply\`（与日志兜底同目录约定）。原子落位（GC4）。
 //!
-//! 全部未命中 → [`DllDiscoveryError`]，列出已搜索路径（任务要求）。
+//! 全部未命中（且无内嵌）→ [`DllDiscoveryError`]，列出已搜索路径（任务要求）。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -35,7 +40,8 @@ impl fmt::Display for DllDiscoveryError {
 
 impl std::error::Error for DllDiscoveryError {}
 
-/// 按上述顺序定位 DLL。
+/// exe 目录标准位（自家管理的解压位置）：以嵌入副本为权威，内容漂移
+/// （旧部署残留、旧版自解压产物）→ 原子覆盖为新版。见 [`locate_dll`]。
 pub fn locate_dll() -> Result<PathBuf, DllDiscoveryError> {
     let candidates = candidate_paths(
         std::env::var(ENV_OVERRIDE).ok().filter(|s| !s.is_empty()),
@@ -44,9 +50,33 @@ pub fn locate_dll() -> Result<PathBuf, DllDiscoveryError> {
             .and_then(|p| p.parent().map(Path::to_path_buf)),
         Path::new(env!("CARGO_MANIFEST_DIR")),
     );
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    // exe 目录树内的两个候选位（标准位 + eng/native 旧布局兼容位）都以嵌入
+    // 副本为权威：内容漂移（旧部署/旧工具布局残留）→ 覆盖为嵌入版。env 覆
+    // 盖不校验（用户显式指定）；仓库内开发态候选（bin/、Gui/eng/native）是
+    // build.rs 权威产物，自然一致。覆盖失败（目标被映射）→ 沿用旧文件。
+    let managed_positions = exe_dir.as_ref().map(|d| {
+        [
+            d.join(DLL_FILE_NAME),
+            d.join("eng").join("native").join(DLL_FILE_NAME),
+        ]
+    });
     for p in &candidates {
         if p.is_file() {
+            if let Some(managed) = &managed_positions {
+                if managed.contains(p) {
+                    refresh_if_stale(p);
+                }
+            }
             return Ok(p.clone());
+        }
+    }
+    // 前 5 项全未命中：部署机场景 —— 解压编译期嵌入的副本（build.rs 准备）。
+    if !EMBEDDED_DLL.is_empty() {
+        if let Some(p) = extract_embedded() {
+            return Ok(p);
         }
     }
     Err(DllDiscoveryError {
@@ -84,6 +114,68 @@ pub fn candidate_paths(
             .join(DLL_FILE_NAME),
     );
     v
+}
+
+/// 编译期嵌入的 DLL 字节（build.rs 从 native/ 构建链准备到 OUT_DIR）。
+/// 无 VS 环境下 build.rs 写空占位文件 → 空切片，运行时跳过兜底。
+static EMBEDDED_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/DdHotapply.dll"));
+
+/// 把嵌入副本解压到 exe 目录；目录只读时退到 `%TEMP%\DdModToolHotapply\`。
+/// 已解压过（目标存在）则直接复用，不重复写盘。
+fn extract_embedded() -> Option<PathBuf> {
+    if EMBEDDED_DLL.is_empty() {
+        return None;
+    }
+    let exe_dir = std::env::current_exe()
+        .ok()?
+        .parent()?
+        .to_path_buf();
+    if let Some(p) = write_dll_atomically(&exe_dir) {
+        return Some(p);
+    }
+    let tmp = std::env::temp_dir().join("DdModToolHotapply");
+    write_dll_atomically(&tmp)
+}
+
+/// `dir/DdHotapply.dll` 不存在则原子写入（.tmp + rename，GC4），存在则复用。
+fn write_dll_atomically(dir: &Path) -> Option<PathBuf> {
+    let target = dir.join(DLL_FILE_NAME);
+    if target.is_file() {
+        return Some(target);
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let tmp = dir.join(format!("{DLL_FILE_NAME}.tmp"));
+    std::fs::write(&tmp, EMBEDDED_DLL).ok()?;
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Some(target),
+        // 并发解压竞态：另一实例已落位 → 复用它的
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            target.is_file().then_some(target)
+        }
+    }
+}
+
+/// 防漂移：`path`（exe 目录树内受管位）内容与嵌入副本不一致 → 原子覆盖
+/// （.tmp + rename，GC4）。一致或嵌入为空（占位构建）→ 不动。
+/// 覆盖失败（目标被映射/占用）→ 静默退回旧文件，下次再试。
+fn refresh_if_stale(path: &Path) {
+    if EMBEDDED_DLL.is_empty() {
+        return;
+    }
+    if let Ok(bytes) = std::fs::read(path) {
+        if bytes == EMBEDDED_DLL {
+            return;
+        }
+    }
+    let Some(dir) = path.parent() else { return };
+    let tmp = dir.join(format!("{DLL_FILE_NAME}.tmp"));
+    if std::fs::write(&tmp, EMBEDDED_DLL).is_ok() {
+        if std::fs::rename(&tmp, path).is_ok() {
+            return;
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +269,47 @@ mod tests {
             Path::new("/m"),
         );
         assert_eq!(paths.len(), 4, "空串 env 不进候选");
+    }
+
+    #[cfg(not(ddhotapply_placeholder))]
+    #[test]
+    fn embedded_dll_is_real_pe_image() {
+        assert!(EMBEDDED_DLL.starts_with(b"MZ"), "嵌入字节应为 PE 镜像");
+        assert!(EMBEDDED_DLL.len() > 1024, "占位才 <1KB，真 DLL 应远大于此");
+    }
+
+    #[cfg(not(ddhotapply_placeholder))]
+    #[test]
+    fn refresh_overwrites_stale_and_idempotent() {
+        let dir = std::env::temp_dir().join(format!("dd-mrm-ha-refresh-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(DLL_FILE_NAME);
+        // 旧部署残留（字节≠嵌入）→ 覆盖
+        std::fs::write(&p, b"MZ stale-bytes").unwrap();
+        refresh_if_stale(&p);
+        assert_eq!(std::fs::read(&p).unwrap(), EMBEDDED_DLL, "残留旧 DLL 必须被嵌入版覆盖");
+        // 已是嵌入版 → 不动（幂等，且不写 .tmp）
+        refresh_if_stale(&p);
+        assert!(!dir.join(format!("{DLL_FILE_NAME}.tmp")).exists(), "一致时不得留 .tmp");
+        assert_eq!(std::fs::read(&p).unwrap(), EMBEDDED_DLL);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_dll_atomically_extracts_then_reuses() {
+        let dir = std::env::temp_dir().join(format!("dd-mrm-ha-emb-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        // 空目录 → 首次解压，字节与嵌入一致
+        let p = write_dll_atomically(&dir).expect("空目录应成功解压");
+        assert!(p.is_file());
+        assert_eq!(std::fs::read(&p).unwrap(), EMBEDDED_DLL, "落盘字节 = 嵌入字节");
+        // 目标已存在 → 复用，不覆盖
+        std::fs::write(&p, b"stale-bytes").unwrap();
+        let p2 = write_dll_atomically(&dir).unwrap();
+        assert_eq!(p2, p);
+        assert_eq!(std::fs::read(&p).unwrap(), b"stale-bytes", "已存在时不得重写");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

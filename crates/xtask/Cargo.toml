@@ -1,0 +1,8 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 打包任务运行器：`cargo dist` 经 .cargo/config.toml 的普通别名转到本 crate。
+# 有意保持 std-only、零依赖，不进发布产物。

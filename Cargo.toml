@@ -5,4 +5,12 @@ members = [
     "crates/save",
     "crates/hotapply",
     "crates/ui-main",
+    "crates/xtask",
 ]
+
+# 体积收窄：strip 符号 + thin LTO + 单 codegen 单元。
+# 注意：不用 panic="abort"——app.rs 依赖 catch_unwind 兜底恢复 UI。
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

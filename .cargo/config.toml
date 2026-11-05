@@ -1,0 +1,4 @@
+# `cargo dist` → 打包发布（构建 release + 组装 dist\dd-mrm.exe）。
+# cargo [alias] 只能展开成 cargo 子命令，故经 xtask crate 桥接（官方惯例）。
+[alias]
+dist = "run -p xtask --release -- dist"

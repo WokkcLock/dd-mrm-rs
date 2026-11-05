@@ -1,4 +1,5 @@
 /target
+/dist
 /logs
 /.tech-tower
 /crates/hotapply/bin/
