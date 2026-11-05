@@ -2,3 +2,5 @@
 /logs
 /.tech-tower
 /crates/hotapply/bin/
+.archify/
+.dsh-ops/
