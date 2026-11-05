@@ -1,0 +1,1597 @@
+// dd-mrm 主窗口 —— 暖纸主题（design-spec 2026-11-04 定稿）：
+//   固定 1280×860；左列 216px = 存档列表（32px 行）+ 存档详情区（218px，DLC chips）；
+//   右双栏 = 已安装 / 已应用（行 46px）；工具栏 = 标题 + 重扫 / 预设管理 / 设置 / 应用；
+//   清空/重置/保存预设/应用预设 → 已应用列表头部按钮；缺失模组 = ⚠ 行 + 状态栏右段 +
+//   清单对话框（dlg 7：过滤 + 虚拟化列表 + 全部移除）。
+// 交互约定不变：拖拽排序/跨列表插入（插入线+幽灵）、双击加/移、Ctrl+↑↓、回车/Delete、
+//   行尾图标钮开目录、Esc=对话末位按钮。显示字符串一律 Rust 组装（slint 哑渲染）。
+//
+// 主题（design-spec 配色表）：声明自己的 Palette 全局覆盖 std-widgets 默认（暖纸），
+// std-widgets 内部控件读取的 Palette 解析到这份声明。字面量仅用于 spec 独有语义色：
+//   警示 #f2e4cf/#c9922a/#7a5a10、强调名 #6a1815、链接 #8a2420/#6a1815。
+
+import { Button, LineEdit, CheckBox, ListView } from "std-widgets.slint";
+export global Palette {
+    in property <color> background: #f5efe2;
+    in property <color> foreground: #2a2520;
+    in property <color> alternate-background: #ece4d2;
+    in property <color> alternate-foreground: #2a2520;
+    in property <color> control-background: #faf5e8;
+    in property <color> control-foreground: #2a2520;
+    in property <color> accent-background: #8a2420;
+    in property <color> accent-foreground: #f5efe2;
+    in property <color> selection-background: #e2d5b4;
+    in property <color> selection-foreground: #2a2520;
+    in property <color> border: #c4b89e;
+}
+
+// ---- 行数据 ----
+
+export struct EstateItem {
+    profile: string,      // profile 槽名 = 目录名（FR1）
+    name: string,         // estate 名（无则回退 profile，Rust 侧决定）
+    count-text: string,   // "N 个模组"（行右侧灰字）
+    ok: bool,             // persist 是否可读
+    error: string,        // 不可读时的中文缘由（进详情区展示）
+}
+
+export struct InstalledItem {
+    title: string,        // 显示名（Rust 组装）
+    dir-name: string,     // 目录名 / 工坊 id
+    source-cn: string,    // 本地 / 工坊
+    icon: image,          // preview_icon.png 缩略图（无 = 空图 → 占位符）
+    icon-path: string,    // 懒解码回填用（行不绑定此字段；空 = 无图标）
+    dir-path: string,     // mod 目录完整路径（图标钮打开；空 = 目录已不存在）
+}
+
+export struct AppliedItem {
+    name: string,         // applied 名（本地=title / 工坊=dir_name，存档文件口径，勿改）
+    title: string,        // 显示名（已安装 mod 的人类可读标题，未命中回退 name）
+    source-cn: string,
+    present: bool,        // 仓库扫描里是否还存在（false → ⚠ 行 + 进缺失清单）
+    icon: image,
+    icon-path: string,    // 懒解码回填用（行不绑定此字段；空 = 无图标）
+    dir-path: string,     // mod 目录完整路径（图标钮打开；空 = 目录已不存在）
+}
+
+export struct PresetItem {
+    name: string,
+    count-text: string,   // "N 条"
+}
+
+export struct MissingItem {
+    name: string,         // applied 口径名（移除匹配键，与 source-cn 合取唯一）
+    source-cn: string,    // 本地 / 工坊
+    reason: string,       // "存档引用 · 本地仓库未找到" 等（Rust 组装）
+}
+
+// ---- 子组件（须先声明后使用） ----
+
+component ColumnHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> badge;
+    height: 38px;
+    background: Palette.alternate-background;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        Text {
+            text: root.title;
+            font-size: 15px;
+            font-weight: 700;
+            color: Palette.foreground;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.badge;
+            font-size: 13px;
+            color: Palette.foreground;
+            opacity: 0.6;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// 文字链接钮（旧工具观感的清空/重置/对话框动作）：主红，悬停加深，禁用变灰。
+component LinkButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: true;
+    callback clicked();
+    height: 22px;
+    vertical-stretch: 0;
+    lt := TouchArea {
+        mouse-cursor: pointer;
+        enabled: root.active;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.label;
+        font-size: 12px;
+        vertical-alignment: center;
+        color: lt.has-hover && root.active ? #6a1815 : #8a2420;
+        opacity: root.active ? 1.0 : 0.35;
+    }
+}
+
+// 描边纸感按钮（方向 A）：细边透明底，悬停填暖沙，按下加深；危险动作用红字；禁用 40% 灰。
+component PaperButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 26px;
+    vertical-stretch: 0;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Palette.border;
+    background: pta.pressed ? #d9cbaa : (pta.has-hover ? #e2d5b4 : transparent);
+    opacity: root.enabled ? 1.0 : 0.4;
+    pb-tx := Text {
+        text: root.label;
+        font-size: 12px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        color: root.danger ? #8a2420 : Palette.foreground;
+    }
+    width: pb-tx.min-width + 26px;
+    pta := TouchArea {
+        mouse-cursor: pointer;
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 存档行（紧凑 32px）：名字 + 右侧模组数；选中 = 左缘 3px 主红 + 选中底。
+component EstateRow inherits Rectangle {
+    in property <EstateItem> item;
+    in property <bool> current;
+    callback clicked();
+    height: 32px;
+    background: root.current
+        ? Palette.selection-background
+        : (ta.has-hover ? Palette.alternate-background : transparent);
+    if root.current : Rectangle {
+        width: 3px;
+        height: 100%;
+        background: Palette.accent-background;
+    }
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 6px;
+        Text {
+            text: root.item.ok ? root.item.name : ("⚠ " + root.item.profile);
+            font-size: 13px;
+            font-weight: 600;
+            vertical-alignment: center;
+            overflow: elide;
+            color: root.item.ok ? Palette.foreground : #8a2420;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Text {
+            text: root.item.ok ? root.item.count-text : "";
+            font-size: 11px;
+            opacity: 0.5;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// mod 缩略图（preview_icon.png）：空图（无图/加载失败/mod 已删）→ 灰底占位符。
+component IconTile inherits Rectangle {
+    in property <image> icon;
+    width: 30px;
+    height: 30px;
+    border-radius: 4px;
+    clip: true;
+    background: Palette.control-background;
+    if icon.width == 0 : Text {
+        text: "▦";
+        font-size: 16px;
+        opacity: 0.35;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if icon.width > 0 : Image {
+        width: 100%;
+        height: 100%;
+        source: icon;
+        image-fit: contain;
+    }
+}
+
+// 来源图标钮（旧 ModItem 同款）：本地=文件夹 / 工坊=steam logo；点击打开 mod 目录。
+// dir-path 为空（mod 已从仓库消失）时不渲染。
+component SourceIcon inherits Rectangle {
+    in property <string> source-cn;
+    in property <string> dir-path;
+    callback open-dir();
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    background: ib.has-hover ? Palette.alternate-background : transparent;
+    border-width: 1px;
+    // 旧版悬停 SkyBlue 辉光的极简替代：悬停描一圈天蓝边。
+    border-color: ib.has-hover ? #87CEEB : transparent;
+    ib := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open-dir(); }
+    }
+    if root.dir-path != "" : Image {
+        width: 18px;
+        height: 18px;
+        source: root.source-cn == "工坊"
+            ? @image-url("icons/steam.svg")
+            : @image-url("icons/file_dir.svg");
+    }
+}
+
+component ModRow inherits Rectangle {
+    in property <InstalledItem> item;
+    in property <bool> current;
+    in property <int> row-idx;         // 模型下标（拖拽落点/选中用）；row 是 slint 布局内置名不可用
+    in property <bool> drag-live;      // 全局拖拽会话进行中（任意行已发起）
+    callback clicked();
+    callback double-clicked();
+    callback drag-start(float, float); // (窗口坐标 px) 该行发起拖拽
+    callback drag-move(float, float);
+    callback drag-end(float, float);
+    callback open-dir();
+    height: 46px;
+    background: root.current
+        ? Palette.selection-background
+        : (ta.has-hover ? Palette.alternate-background : transparent);
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        double-clicked => { root.double-clicked(); }
+        moved => {
+            // 拖拽启动：按住移动超过 4px（区分点击）。坐标 = 行绝对位置 + 行内鼠标。
+            if (self.pressed && !root.own-drag && !root.drag-live
+                && (abs(self.mouse-x - self.pressed-x) > 4px
+                    || abs(self.mouse-y - self.pressed-y) > 4px)) {
+                root.own-drag = true;
+                root.drag-start(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+            if (root.own-drag) {
+                root.drag-move(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up && root.own-drag) {
+                root.own-drag = false;
+                root.drag-end(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+    }
+    in-out property <bool> own-drag: false; // 本行发起且未松手
+
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 8px;
+        IconTile { icon: root.item.icon; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Text {
+                text: root.item.title;
+                color: root.current ? Palette.selection-foreground : Palette.foreground;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.dir-name;
+                font-size: 11px;
+                opacity: 0.6;
+                color: root.current ? Palette.selection-foreground : Palette.foreground;
+                overflow: elide;
+            }
+        }
+        Rectangle { vertical-stretch: 1; }
+        SourceIcon {
+            source-cn: root.item.source-cn;
+            dir-path: root.item.dir-path;
+            open-dir => { root.open-dir(); }
+        }
+    }
+}
+
+component AppliedRow inherits Rectangle {
+    in property <AppliedItem> item;
+    in property <bool> current;
+    in property <int> row-idx;         // 模型下标
+    in property <int> total;           // 列表总行数（末尾插入指示用）
+    in property <int> drop-idx;        // 全局插入位置（-1 = 无）
+    in property <bool> drag-live;      // 全局拖拽会话进行中
+    callback clicked();
+    callback double-clicked();
+    callback drag-start(float, float);
+    callback drag-move(float, float);
+    callback drag-end(float, float);
+    callback open-dir();
+    height: 46px;
+    // 缺失行（present=false）：琥珀底警示（design-spec 状态④）。
+    background: root.current
+        ? Palette.selection-background
+        : (ta.has-hover ? Palette.alternate-background
+            : (root.item.present ? transparent : #f2e4cf));
+    if !root.item.present : Rectangle {
+        width: 3px;
+        height: 100%;
+        background: #c9922a;
+    }
+
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        double-clicked => { root.double-clicked(); }
+        moved => {
+            if (self.pressed && !root.own-drag && !root.drag-live
+                && (abs(self.mouse-x - self.pressed-x) > 4px
+                    || abs(self.mouse-y - self.pressed-y) > 4px)) {
+                root.own-drag = true;
+                root.drag-start(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+            if (root.own-drag) {
+                root.drag-move(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up && root.own-drag) {
+                root.own-drag = false;
+                root.drag-end(
+                    (ta.absolute-position.x + self.mouse-x) / 1px,
+                    (ta.absolute-position.y + self.mouse-y) / 1px);
+            }
+        }
+    }
+    in-out property <bool> own-drag: false;
+
+    // 插入位置指示线（旧 GongSolutions Insert adorner）：插在该行上缘，或末行下缘=末尾。
+    if root.drop-idx == root.row-idx : Rectangle {
+        y: 0;
+        height: 3px;
+        background: Palette.accent-background;
+    }
+    if root.total > 0 && root.drop-idx == root.total && root.row-idx == root.total - 1 : Rectangle {
+        y: parent.height - 3px;
+        height: 3px;
+        background: Palette.accent-background;
+    }
+
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 8px;
+        IconTile { icon: root.item.icon; }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Text {
+                text: root.item.present ? root.item.title : "⚠ " + root.item.title;
+                color: root.current ? Palette.selection-foreground
+                    : (root.item.present ? Palette.foreground : #7a5a10);
+                overflow: elide;
+            }
+            Text {
+                text: root.item.present ? root.item.source-cn : root.item.source-cn + "（仓库中已不存在，应用前请确认）";
+                font-size: 11px;
+                opacity: 0.6;
+                color: root.current ? Palette.selection-foreground : Palette.foreground;
+                overflow: elide;
+            }
+        }
+        Rectangle { vertical-stretch: 1; }
+        SourceIcon {
+            source-cn: root.item.source-cn;
+            dir-path: root.item.dir-path;
+            open-dir => { root.open-dir(); }
+        }
+    }
+}
+
+component SettingsRow inherits Rectangle {
+    in property <string> label;
+    in-out property <string> path;
+    callback browse();
+    callback open();
+    height: 34px;
+    // 紧凑单行（设计定稿 2026-11-05 方向 A）：标签左对齐 + 输入 + 行内动作链接，无卡片底。
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 8px;
+        Text {
+            width: 110px;
+            text: root.label;
+            font-size: 12px;
+            font-weight: 600;
+            color: Palette.foreground;
+            opacity: 0.8;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        LineEdit {
+            text <=> root.path;
+            horizontal-stretch: 1;
+        }
+        LinkButton {
+            label: "浏览…";
+            clicked => { root.browse(); }
+        }
+        LinkButton {
+            label: "打开";
+            clicked => { root.open(); }
+        }
+    }
+}
+
+// 节头：小号节名（accent 酒红）+ 细横线（设计定稿 2026-11-05 方向 A）。
+component SettingsSection inherits Rectangle {
+    in property <string> name;
+    height: 20px;
+    background: transparent;
+    HorizontalLayout {
+        spacing: 10px;
+        Text {
+            text: root.name;
+            font-size: 12px;
+            font-weight: 700;
+            color: Palette.foreground;
+            opacity: 0.85;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// 热修改开关：纸感 pill switch（开=accent 底白钮，关=纸色底），行内即时翻转，
+// 随「保存并重扫」落盘生效。
+component HotapplySwitch inherits Rectangle {
+    width: 40px;
+    height: 22px;
+    border-radius: 11px;
+    background: root.on ? Palette.accent-background : Palette.control-background;
+    border-width: 1px;
+    border-color: root.on ? Palette.accent-background : Palette.border;
+    animate background { duration: 120ms; }
+
+    in property <bool> on;
+    callback toggled();
+
+    knob := Rectangle {
+        width: 16px;
+        height: 16px;
+        y: 2px;
+        x: root.on ? root.width - self.width - 4px : 4px;
+        animate x { duration: 120ms; easing: ease-out; }
+        border-radius: 8px;
+        background: Palette.control-foreground;
+        border-width: 1px;
+        border-color: root.on ? Palette.accent-background : Palette.border;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+}
+
+// ---- 对话层编号（Rust 侧同一套常量） ----
+// 0 无 · 1 确认(2钮) · 2 备份失败(3钮) · 3 存预设 · 4 载预设 · 5 设置 · 6 错误
+//   · 7 缺失清单（过滤 + 全部移除）
+
+export component AppWindow inherits Window {
+    // 全局字体：微软雅黑 UI（中英同源，字重一致）。原 JetBrains Mono NL 无中文字形，
+    // 中文全部回退雅黑 → 同屏两种字重不协调；旧工具（WPF 默认雅黑）正是同源字体所以和谐。
+    default-font-family: "Microsoft YaHei UI";
+    title: root.dirty ? "dd-mrm · 暗黑地牢 Mod 管理 — 有未应用的修改" : "dd-mrm · 暗黑地牢 Mod 管理";
+    // 默认 1280×860（可拉伸；启动时 Rust 侧按逻辑工作区收窄，见 app.rs clamp_init_size）。
+    // 显式 min/max：两列 width 公式绑定 root.width 会让内容推导的 max-width 收敛到极小值，
+    // 必须在 Window 上显式声明尺寸边界。
+    in property <length> init-width: 1280px;
+    in property <length> init-height: 860px;
+    preferred-width: root.init-width;
+    preferred-height: root.init-height;
+    min-width: 640px;
+    min-height: 480px;
+    max-width: 4096px;
+    max-height: 4096px;
+    background: Palette.background;
+    forward-focus: fs-estates;
+
+    // ---- 模型 ----
+    in property <[EstateItem]> estate-model;
+    in property <[InstalledItem]> installed-model;
+    in property <[AppliedItem]> applied-model;
+    in property <[PresetItem]> preset-model;
+    in property <[string]> failed-model;
+    in property <int> failed-count: 0;
+    in property <string> failed-summary-text: "";
+
+    // ---- 列头徽标（Rust 组装字符串） ----
+    in property <string> estate-count-text: "";
+    in property <string> installed-count-text: "";
+    in property <string> applied-count-text: "";
+
+    // ---- 存档详情区（左列底部 218px；随已载入档变化） ----
+    in-out property <bool> detail-visible: false;
+    in property <string> detail-name: "";
+    in property <string> detail-meta: "";    // "血月 · 12 个模组 · profile_0"
+    in property <string> detail-error: "";   // persist 不可读时的缘由
+    in property <[string]> detail-dlcs-a;    // DLC chips 左列（Rust 奇偶拆分）
+    in property <[string]> detail-dlcs-b;    // DLC chips 右列
+
+    // ---- 选择 / 状态 ----
+    in-out property <int> current-estate: -1;
+    in-out property <int> current-installed: -1;
+    in-out property <int> current-applied: -1;
+    in-out property <bool> dirty: false;
+    in-out property <bool> applying: false;
+    in property <bool> first-run: false;
+    in property <bool> has-presets: false;
+    in property <string> game-state-text: "游戏未运行";
+    in property <string> status-text: "就绪";
+    in property <int> status-kind: 0;      // 0 就绪 1 引擎就绪 2 应用中 3 结果
+    in property <string> estate-hint: "";  // 存档列表下方提示（首跑/空态）
+
+    // ---- 过滤与失败目录 ----
+    in-out property <string> installed-filter: "";
+    in-out property <bool> show-failed: false;
+
+    // ---- 缺失模组（状态④三入口共用一份清单） ----
+    in property <int> missing-count: 0;
+    in property <[MissingItem]> missing-model;
+    in-out property <string> missing-filter: "";
+    in property <string> missing-filtered-text: "";
+
+    // ---- 拖拽会话（旧 GongSolutions 同款：拖动显示插入线，松手落位）----
+    in-out property <int> drag-src: 0;      // 0 无 / 1 装列表 / 2 应用列表
+    in-out property <int> drag-index: -1;   // 源行模型下标
+    in-out property <int> drop-index: -1;   // 应用列表插入位置（0..len；-1 无指示）
+    in-out property <string> drag-title: "";
+    in-out property <length> drag-ghost-x;
+    in-out property <length> drag-ghost-y;
+
+    // ---- 对话层 ----
+    in-out property <int> dlg-kind: 0;
+    in property <string> dlg-title;
+    in property <string> dlg-message;
+    in property <[string]> dlg-buttons;
+    in property <string> dlg-cancel-label;   // 取消钮（恒可点、居右），由 Rust 侧从按钮表末位摘出
+    in-out property <string> dlg-input: "";
+    in-out property <int> dlg-list-current: -1;
+    in-out property <string> cfg-save-root;
+    // 设置开关：是否启用热修改（游戏运行中注入）。关 = 只写存档文件。
+    in-out property <bool> cfg-hotapply: true;
+    in-out property <string> cfg-local-mods;
+    in-out property <string> cfg-workshop;
+
+    // ---- 回调 ----
+    callback estate-selected(int);      // 单击/回车：请求切换档（脏则 Rust 先确认）
+    callback installed-clicked(int);
+    callback installed-activated(int);  // 双击/回车：加入已应用尾部
+    callback applied-clicked(int);
+    callback applied-activated(int);    // 回车：移除（镜像“加入”）
+    callback applied-move(int, int);    // (下标, -1|+1)（Ctrl+↑↓ 键盘排序）
+    callback filter-changed(string);
+    callback icons-visible(float, float);   // 装列表视口(滚动偏移px, 可视高px)：可见行图标插队解码
+    callback drag-update(float, float, float);          // (指针窗口y, 应用列表窗口y, content-y px) → 更新插入线
+    callback drag-finish(int, int, float, float, float); // (源列表, 源行下标, 指针窗口y, 列表窗口y, content-y px) → 落位
+    callback drag-update-ghost(float, float);           // 拖拽幽灵跟随（纯 UI，窗口坐标 px）
+    drag-update-ghost(px, py) => {
+        root.drag-ghost-x = px * 1px;
+        root.drag-ghost-y = py * 1px;
+    }
+    callback open-mod-dir(string);           // 打开 mod 目录（资源管理器）
+    callback rescan-clicked();
+    callback apply-clicked();
+    callback clear-clicked();
+    callback reset-clicked();
+    callback settings-clicked();
+    callback save-preset-clicked();          // 已应用头部「保存预设」：存当前列表
+    callback apply-preset-clicked();         // 已应用头部「应用预设」：选预设载入
+    callback preset-manage-clicked();        // 工具栏「预设管理」：重命名 / 删除
+    callback missing-open();                 // 缺失清单：状态栏右段 / ⚠行 两入口
+    callback missing-filter-changed(string);
+    callback missing-remove(int);            // 清单内逐项移除（模型下标）
+    callback dlg-button-clicked(int);   // 对话层按钮下标（0 起；Esc = 末位）
+    callback dlg-list-clicked(int);
+    callback preset-load-row(int);      // 应用预设：行内「载入」（行下标）
+    callback preset-rename-row(int);    // 预设管理：行内「重命名」（行下标）
+    callback preset-delete-row(int);    // 预设管理：行内「删除」（行下标）
+    callback preset-overwrite-row(int); // 保存预设：双击行 = 覆盖（弹确认框）（行下标）
+    callback browse-dir(int);           // 0 存档根 1 本地 mods 2 工坊
+    callback open-dir(int);
+
+    // 对话层关闭后把键盘焦点还给存档列表。
+    changed dlg-kind => {
+        if (self.dlg-kind == 0) {
+            fs-estates.focus();
+        }
+    }
+
+    // ================= 布局 =================
+
+    VerticalLayout {
+        spacing: 0;
+
+        // ---- 工具栏（标题 + 主操作右置） ----
+        HorizontalLayout {
+            height: 52px;
+            padding-left: 14px;
+            padding-right: 12px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 8px;
+
+            Text {
+                text: "dd-mrm";
+                font-size: 16px;
+                font-weight: 800;
+                color: #6a1815;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            PaperButton {
+                label: "重扫";
+                enabled: !root.applying;
+                clicked => { root.rescan-clicked(); }
+            }
+            PaperButton {
+                label: "预设管理";
+                enabled: !root.applying;
+                clicked => { root.preset-manage-clicked(); }
+            }
+            PaperButton {
+                label: "设置";
+                enabled: !root.applying;
+                clicked => { root.settings-clicked(); }
+            }
+            Button {
+                text: root.applying ? "应用中…" : "应用";
+                primary: true;
+                enabled: root.current-estate >= 0 && !root.applying;
+                clicked => { root.apply-clicked(); }
+            }
+        }
+
+        // ---- 主体：左列（存档+详情） | 已安装 | 已应用 ----
+        // 三列走绝对定位（x/width 显式）：列宽公式读窗口宽但不进布局协商，
+        // 根除 slint 绑定环警告（width ↔ layoutinfo-h，新版本 slint 会 panic）。
+        Rectangle {
+            vertical-stretch: 1;
+
+            // ═ 列 1：存档 216px + 详情区 218px（design-spec） ═
+            VerticalLayout {
+                x: 0px;
+                y: 0px;
+                width: 216px;
+                height: parent.height;
+                spacing: 0;
+
+                ColumnHeader {
+                    title: "存档";
+                    badge: root.estate-count-text;
+                }
+
+                if root.first-run : Rectangle {
+                    height: 92px;
+                    background: Palette.alternate-background;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 6px;
+                        Text {
+                            text: "首次运行：请先在设置中选择存档根目录";
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            color: Palette.foreground;
+                            vertical-stretch: 1;
+                        }
+                        PaperButton {
+                            label: "打开设置";
+                            clicked => { root.settings-clicked(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+
+                    // 键盘焦点代理：零尺寸不挡点击（std-widgets 同手法），ListView 内只放 for。
+                    fs-estates := FocusScope {
+                        x: 0px;
+                        y: 0px;
+                        width: 0px;
+                        height: 0px;
+                        key-pressed(event) => {
+                            if (event.text == Key.UpArrow) {
+                                if (root.current-estate > 0) {
+                                    root.current-estate = root.current-estate - 1;
+                                } else if (root.current-estate < 0 && root.estate-model.length > 0) {
+                                    root.current-estate = 0;
+                                }
+                                return accept;
+                            } else if (event.text == Key.DownArrow) {
+                                if (root.current-estate < 0 && root.estate-model.length > 0) {
+                                    root.current-estate = 0;
+                                } else if (root.current-estate < root.estate-model.length - 1) {
+                                    root.current-estate = root.current-estate + 1;
+                                }
+                                return accept;
+                            } else if (event.text == Key.Return) {
+                                if (root.current-estate >= 0) {
+                                    root.estate-selected(root.current-estate);
+                                }
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
+                    ListView {
+                        for item[index] in root.estate-model : EstateRow {
+                            item: item;
+                            current: index == root.current-estate;
+                            clicked => {
+                                root.current-estate = index;
+                                fs-estates.focus();
+                                root.estate-selected(index);
+                            }
+                        }
+                    }
+                }
+
+                if root.estate-hint != "" : Rectangle {
+                    height: 36px;
+                    background: Palette.alternate-background;
+                    Text {
+                        x: 10px;
+                        vertical-alignment: center;
+                        text: root.estate-hint;
+                        color: Palette.foreground;
+                        opacity: 0.8;
+                        font-size: 12px;
+                        overflow: elide;
+                        width: parent.width - 20px;
+                    }
+                }
+
+                // ---- 存档详情区（218px 贴底） ----
+                Rectangle {
+                    height: 218px;
+                    background: Palette.alternate-background;
+
+                    if !root.detail-visible : VerticalLayout {
+                        alignment: center;
+                        spacing: 6px;
+                        Text {
+                            text: "未选择存档";
+                            horizontal-alignment: center;
+                            font-size: 13px;
+                            opacity: 0.7;
+                        }
+                        Text {
+                            text: "点击上方列表查看\n模式 / DLC / 模组数";
+                            horizontal-alignment: center;
+                            font-size: 11px;
+                            opacity: 0.45;
+                        }
+                    }
+
+                    if root.detail-visible : VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        Text {
+                            text: "存档详情";
+                            font-size: 10px;
+                            opacity: 0.5;
+                        }
+                        Text {
+                            text: root.detail-name;
+                            font-size: 16px;
+                            font-weight: 700;
+                            color: #6a1815;
+                            overflow: elide;
+                            wrap: no-wrap;
+                        }
+                        if root.detail-meta != "" : Text {
+                            text: root.detail-meta;
+                            font-size: 11px;
+                            opacity: 0.6;
+                            wrap: word-wrap;
+                        }
+                        if root.detail-error != "" : Text {
+                            text: root.detail-error;
+                            font-size: 11px;
+                            color: #8a2420;
+                            wrap: word-wrap;
+                        }
+                        Rectangle { height: 1px; background: Palette.border; }
+                        if root.detail-dlcs-a.length > 0 : VerticalLayout {
+                            spacing: 4px;
+                            Text {
+                                text: "已启用内容";
+                                font-size: 10px;
+                                opacity: 0.5;
+                            }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    for d in root.detail-dlcs-a : Rectangle {
+                                        height: 20px;
+                                        border-width: 1px;
+                                        border-color: Palette.border;
+                                        border-radius: 4px;
+                                        background: Palette.control-background;
+                                        Text {
+                                            text: d;
+                                            font-size: 11px;
+                                            opacity: 0.75;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 4px;
+                                    for d in root.detail-dlcs-b : Rectangle {
+                                        height: 20px;
+                                        border-width: 1px;
+                                        border-color: Palette.border;
+                                        border-radius: 4px;
+                                        background: Palette.control-background;
+                                        Text {
+                                            text: d;
+                                            font-size: 11px;
+                                            opacity: 0.75;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ═ 列 2：已安装模组（FR2） ═
+            VerticalLayout {
+                x: 217px;
+                y: 0px;
+                width: (parent.width - 216px - 2px) / 2;
+                height: parent.height;
+                spacing: 0;
+
+                ColumnHeader {
+                    title: "已安装模组";
+                    badge: root.installed-count-text;
+                }
+
+                Rectangle {
+                    height: 44px;
+                    LineEdit {
+                        x: 8px; y: 6px;
+                        width: parent.width - 16px;
+                        height: 32px;
+                        placeholder-text: "过滤（标题或目录名）…";
+                        text <=> root.installed-filter;
+                        edited(text) => { root.filter-changed(text); }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+
+                    fs-installed := FocusScope {
+                        x: 0px;
+                        y: 0px;
+                        width: 0px;
+                        height: 0px;
+                        key-pressed(event) => {
+                            if (event.text == Key.UpArrow) {
+                                if (root.current-installed > 0) {
+                                    root.current-installed = root.current-installed - 1;
+                                } else if (root.current-installed < 0 && root.installed-model.length > 0) {
+                                    root.current-installed = 0;
+                                }
+                                return accept;
+                            } else if (event.text == Key.DownArrow) {
+                                if (root.current-installed < 0 && root.installed-model.length > 0) {
+                                    root.current-installed = 0;
+                                } else if (root.current-installed < root.installed-model.length - 1) {
+                                    root.current-installed = root.current-installed + 1;
+                                }
+                                return accept;
+                            } else if (event.text == Key.Return) {
+                                if (root.current-installed >= 0) {
+                                    root.installed-activated(root.current-installed);
+                                }
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
+                    ListView {
+                        changed content-y => {
+                            root.icons-visible(-self.content-y / 1px, self.visible-height / 1px);
+                        }
+                        for item[index] in root.installed-model : ModRow {
+                            item: item;
+                            current: index == root.current-installed;
+                            row-idx: index;
+                            drag-live: root.drag-src != 0;
+                            clicked => {
+                                root.current-installed = index;
+                                fs-installed.focus();
+                            }
+                            double-clicked => {
+                                root.current-installed = index;
+                                fs-installed.focus();
+                                root.installed-activated(index);
+                            }
+                            drag-start(px, py) => {
+                                root.drag-src = 1;
+                                root.drag-index = index;
+                                root.drag-title = item.title;
+                                root.drag-update-ghost(px, py);
+                            }
+                            drag-move(px, py) => {
+                                root.drag-update-ghost(px, py);
+                                root.drag-update(py, applied-lv.absolute-position.y / 1px, applied-lv.content-y / 1px);
+                            }
+                            drag-end(px, py) => {
+                                root.drag-finish(1, index, py, applied-lv.absolute-position.y / 1px, applied-lv.content-y / 1px);
+                                root.drag-src = 0;
+                                root.drop-index = -1;
+                            }
+                            open-dir => { root.open-mod-dir(item.dir-path); }
+                        }
+                    }
+                }
+
+                // 扫描失败目录（非阻塞披露：计数 + 可展开列表）
+                if root.failed-count > 0 : Rectangle {
+                    height: root.show-failed ? 150px : 36px;
+                    clip: true;
+                    background: Palette.alternate-background;
+
+                    CheckBox {
+                        x: 10px; y: 6px;
+                        text: root.failed-summary-text;
+                        checked <=> root.show-failed;
+                    }
+
+                    if root.show-failed : ListView {
+                        y: 36px;
+                        width: parent.width;
+                        height: 110px;
+                        for p in root.failed-model : Rectangle {
+                            height: 26px;
+                            Text {
+                                x: 26px;
+                                vertical-alignment: center;
+                                text: p;
+                                font-size: 12px;
+                                color: Palette.foreground;
+                                overflow: elide;
+                                width: parent.width - 32px;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ═ 列 3：已应用模组（FR3） ═
+            VerticalLayout {
+                x: 217px + (parent.width - 216px - 2px) / 2 + 1px;
+                y: 0px;
+                width: (parent.width - 216px - 2px) / 2;
+                height: parent.height;
+                spacing: 0;
+
+                // 头部：标题 + 计数 + 保存预设/应用预设/清空/重置按钮（缺失入口只在状态栏）。
+                Rectangle {
+                    height: 38px;
+                    background: Palette.alternate-background;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 10px;
+                        Text {
+                            text: "已应用模组";
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.applied-count-text;
+                            font-size: 13px;
+                            color: Palette.foreground;
+                            opacity: 0.6;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        PaperButton {
+                            label: "保存预设";
+                            enabled: root.current-estate >= 0 && !root.applying;
+                            clicked => { root.save-preset-clicked(); }
+                        }
+                        PaperButton {
+                            label: "应用预设";
+                            enabled: root.has-presets && !root.applying;
+                            clicked => { root.apply-preset-clicked(); }
+                        }
+                        PaperButton {
+                            label: "清空";
+                            danger: true;
+                            enabled: root.current-estate >= 0 && root.applied-model.length > 0 && !root.applying;
+                            clicked => { root.clear-clicked(); }
+                        }
+                        PaperButton {
+                            label: "重置";
+                            enabled: root.dirty && !root.applying;
+                            clicked => { root.reset-clicked(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+
+                    fs-applied := FocusScope {
+                        x: 0px;
+                        y: 0px;
+                        width: 0px;
+                        height: 0px;
+                        key-pressed(event) => {
+                            if (event.text == Key.UpArrow && (event.modifiers.control || event.modifiers.alt)) {
+                                root.applied-move(root.current-applied, -1);
+                                return accept;
+                            } else if (event.text == Key.DownArrow && (event.modifiers.control || event.modifiers.alt)) {
+                                root.applied-move(root.current-applied, 1);
+                                return accept;
+                            } else if (event.text == Key.UpArrow) {
+                                if (root.current-applied > 0) {
+                                    root.current-applied = root.current-applied - 1;
+                                } else if (root.current-applied < 0 && root.applied-model.length > 0) {
+                                    root.current-applied = 0;
+                                }
+                                return accept;
+                            } else if (event.text == Key.DownArrow) {
+                                if (root.current-applied < 0 && root.applied-model.length > 0) {
+                                    root.current-applied = 0;
+                                } else if (root.current-applied < root.applied-model.length - 1) {
+                                    root.current-applied = root.current-applied + 1;
+                                }
+                                return accept;
+                            } else if (event.text == Key.Return || event.text == Key.Delete) {
+                                if (root.current-applied >= 0) {
+                                    root.applied-activated(root.current-applied);
+                                }
+                                return accept;
+                            }
+                            reject
+                        }
+                    }
+
+                    applied-lv := ListView {
+                        for item[index] in root.applied-model : AppliedRow {
+                            item: item;
+                            current: index == root.current-applied;
+                            row-idx: index;
+                            total: root.applied-model.length;
+                            drop-idx: root.drop-index;
+                            drag-live: root.drag-src != 0;
+                            clicked => {
+                                root.current-applied = index;
+                                fs-applied.focus();
+                            }
+                            double-clicked => {
+                                root.current-applied = index;
+                                fs-applied.focus();
+                                root.applied-activated(index);
+                            }
+                            drag-start(px, py) => {
+                                root.drag-src = 2;
+                                root.drag-index = index;
+                                root.drag-title = item.title;
+                                root.drag-update-ghost(px, py);
+                            }
+                            drag-move(px, py) => {
+                                root.drag-update-ghost(px, py);
+                                root.drag-update(py, applied-lv.absolute-position.y / 1px, applied-lv.content-y / 1px);
+                            }
+                            drag-end(px, py) => {
+                                root.drag-finish(2, index, py, applied-lv.absolute-position.y / 1px, applied-lv.content-y / 1px);
+                                root.drag-src = 0;
+                                root.drop-index = -1;
+                            }
+                            open-dir => { root.open-mod-dir(item.dir-path); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 36px;
+                    background: Palette.alternate-background;
+                    Text {
+                        x: 10px;
+                        vertical-alignment: center;
+                        text: "回车/双击 = 移除 · Ctrl+↑↓ = 排序 · 拖拽排序 / 跨列表插入";
+                        color: Palette.foreground;
+                        opacity: 0.6;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+
+        // ---- 状态栏（FR9 四态） ----
+        Rectangle {
+            height: 30px;
+            background: Palette.alternate-background;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 10px;
+                spacing: 12px;
+
+                Rectangle {
+                    // 240px 容纳最长文案「🎮 游戏运行中 · 引擎未接入」（180px 曾截断；
+                    // 自适应宽度因 elide min-width=0 翻车，退回固定值）。
+                    width: 240px;
+                    border-radius: 4px;
+                    // kind 2 应用中（selection）/ 1 引擎就绪（accent，可热应用）/ 其它 control。
+                    background: root.status-kind == 2 ? Palette.selection-background
+                        : (root.status-kind == 1 ? Palette.accent-background : Palette.control-background);
+                    Text {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        vertical-alignment: center;
+                        text: root.status-kind == 2 ? "应用中…" : root.game-state-text;
+                        color: root.status-kind == 2 ? Palette.selection-foreground
+                            : (root.status-kind == 1 ? Palette.accent-foreground : Palette.control-foreground);
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                }
+
+                Text {
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    text: root.status-text;
+                    color: Palette.foreground;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+
+                if root.dirty : Rectangle {
+                    width: 130px;
+                    border-radius: 4px;
+                    background: Palette.accent-background;
+                    Text {
+                        x: 0px;
+                        width: parent.width;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                        text: "● 有未应用的修改";
+                        color: Palette.accent-foreground;
+                        font-size: 12px;
+                    }
+                }
+
+                // 缺失常驻入口（状态栏右侧固定段；不动态增删内容行，无布局跳动）。
+                if root.missing-count > 0 : Rectangle {
+                    width: 210px;
+                    border-radius: 4px;
+                    background: #f2e4cf;
+                    ms-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.missing-open(); }
+                    }
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 0px;
+                        Text {
+                            vertical-alignment: center;
+                            text: "⚠ \{root.missing-count} 缺失";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: #8a2420; // 感叹号/计数红色，更显眼
+                            overflow: elide;
+                        }
+                        Text {
+                            vertical-alignment: center;
+                            text: " · 点击查看清单 ›";
+                            font-size: 12px;
+                            color: #7a5a10;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================= 拖拽幽灵（跟随指针的半透明行摘要） =================
+
+    if root.drag-src != 0 : Rectangle {
+        x: root.drag-ghost-x - self.width / 2;
+        y: root.drag-ghost-y - 14px;
+        height: 28px;
+        border-radius: 4px;
+        background: Palette.control-background;
+        border-width: 1px;
+        border-color: Palette.border;
+        opacity: 0.9;
+        ghost-t := Text {
+            x: 8px;
+            width: parent.width - 16px;
+            vertical-alignment: center;
+            text: root.drag-title;
+            font-size: 12px;
+            color: Palette.foreground;
+            overflow: elide;
+        }
+        width: min(ghost-t.min-width + 16px, 320px);
+    }
+
+    // ================= 对话层（模态遮罩） =================
+
+    if root.dlg-kind > 0 : Rectangle {
+        background: #00000066;
+
+        // 吃掉遮罩下的点击（模态）。
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 560px;
+            height: root.dlg-kind == 5 ? 420px
+                : ((root.dlg-kind == 4 || root.dlg-kind == 8
+                    || (root.dlg-kind == 3 && root.dlg-title == "保存预设")) ? 420px
+                    : (root.dlg-kind == 7 ? 480px : 250px));
+            border-radius: 8px;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.border;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000088;
+            drop-shadow-offset-y: 4px;
+            init => { fs-dialog.focus(); }
+
+            fs-dialog := FocusScope {
+                x: 0px;
+                y: 0px;
+                width: 0px;
+                height: 0px;
+                key-pressed(event) => {
+                    if (event.text == Key.Escape) {
+                        root.dlg-button-clicked(root.dlg-buttons.length);
+                        return accept;
+                    } else if (root.dlg-kind == 7 && event.text == Key.Return) {
+                        // 缺失清单：回车 = 关闭（末位取消钮），防止误触「全部移除」。
+                        root.dlg-button-clicked(root.dlg-buttons.length);
+                        return accept;
+                    } else if ((root.dlg-kind == 4 || root.dlg-kind == 8) && event.text == Key.Return) {
+                        // 预设对话：回车 = 关闭（末位取消钮），防止误触「载入/重命名/删除」。
+                        root.dlg-button-clicked(root.dlg-buttons.length);
+                        return accept;
+                    } else if (event.text == Key.Return) {
+                        // 其余回车 = 首钮（预设对话框首钮=关闭，回车只收起对话层）。
+                        root.dlg-button-clicked(0);
+                        return accept;
+                    } else if ((root.dlg-kind == 4 || root.dlg-kind == 8)
+                        && (event.text == Key.UpArrow || event.text == Key.DownArrow)) {
+                        if (event.text == Key.UpArrow && root.dlg-list-current > 0) {
+                            root.dlg-list-current = root.dlg-list-current - 1;
+                        } else if (event.text == Key.DownArrow && root.dlg-list-current < root.preset-model.length - 1) {
+                            root.dlg-list-current = root.dlg-list-current + 1;
+                        }
+                        return accept;
+                    }
+                    reject
+                }
+            }
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: root.dlg-title;
+                    font-size: 17px;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                }
+
+                if root.dlg-kind == 1 || root.dlg-kind == 2 || root.dlg-kind == 6 : Text {
+                    text: root.dlg-message;
+                    wrap: word-wrap;
+                    color: Palette.foreground;
+                    vertical-stretch: 1;
+                }
+
+                // 存预设 / 重命名预设：名称输入（Enter = 确认）
+                if root.dlg-kind == 3 : VerticalLayout {
+                    spacing: 8px;
+                    vertical-stretch: root.dlg-title == "保存预设" ? 0 : 1;
+                    Text {
+                        text: root.dlg-title == "重命名预设" ? "新名字：" : "新预设名：";
+                        color: Palette.foreground;
+                    }
+                    LineEdit {
+                        text <=> root.dlg-input;
+                        placeholder-text: "如：血月主力队";
+                        accepted(text) => { root.dlg-button-clicked(0); }
+                    }
+                }
+
+                // 保存预设：已有预设列表（纯行 = 名字+条数；双击行 = 覆盖，弹确认框；输入框只管新增）
+                if root.dlg-kind == 3 && root.dlg-title == "保存预设" : Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 4px;
+
+                    VerticalLayout {
+
+                        ListView {
+                            vertical-stretch: 1;
+                            for item[index] in root.preset-model : Rectangle {
+                                height: 40px;
+                                background: sta.has-hover ? Palette.alternate-background : transparent;
+                                sta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    double-clicked => { root.preset-overwrite-row(index); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    Text {
+                                        vertical-alignment: center;
+                                        text: item.name;
+                                        font-weight: 600;
+                                        color: Palette.foreground;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+                                    Text {
+                                        vertical-alignment: center;
+                                        text: item.count-text;
+                                        font-size: 11px;
+                                        opacity: 0.6;
+                                        color: Palette.foreground;
+                                    }
+                                }
+                            }
+                        }
+
+                        Text {
+                            height: 24px;
+                            text: "双击已有预设进行覆盖";
+                            font-size: 11px;
+                            opacity: 0.55;
+                            color: Palette.foreground;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // 预设列表（dlg 4 = 应用预设 / dlg 8 = 预设管理）：纯行（名字+条数），动作收在底部操作栏
+                if root.dlg-kind == 4 || root.dlg-kind == 8 : Rectangle {
+                    vertical-stretch: 1;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    border-radius: 4px;
+
+                    ListView {
+                        for item[index] in root.preset-model : Rectangle {
+                            height: 40px;
+                            background: index == root.dlg-list-current
+                                ? Palette.selection-background
+                                : (ta.has-hover ? Palette.alternate-background : transparent);
+                            ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.dlg-list-current = index;
+                                    root.dlg-list-clicked(index);
+                                }
+                            }
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                Text {
+                                    vertical-alignment: center;
+                                    text: item.name;
+                                    font-weight: 600;
+                                    color: index == root.dlg-list-current ? Palette.selection-foreground : Palette.foreground;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+                                Text {
+                                    vertical-alignment: center;
+                                    text: item.count-text;
+                                    font-size: 11px;
+                                    opacity: 0.6;
+                                    color: index == root.dlg-list-current ? Palette.selection-foreground : Palette.foreground;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 缺失清单（dlg 7）：过滤 + 计数 + 虚拟化列表 + 全量移除
+                if root.dlg-kind == 7 : VerticalLayout {
+                    spacing: 8px;
+                    vertical-stretch: 1;
+
+                    Text {
+                        text: root.dlg-message;
+                        wrap: word-wrap;
+                        color: Palette.foreground;
+                        opacity: 0.75;
+                        font-size: 12px;
+                    }
+
+                    LineEdit {
+                        text <=> root.missing-filter;
+                        placeholder-text: "过滤（标题或 id）…";
+                        edited(text) => { root.missing-filter-changed(text); }
+                    }
+
+                    Text {
+                        text: root.missing-filtered-text;
+                        font-size: 11px;
+                        opacity: 0.55;
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-width: 1px;
+                        border-color: Palette.border;
+                        border-radius: 4px;
+
+                        ListView {
+                            for m[index] in root.missing-model : Rectangle {
+                                height: 40px;
+                                background: mta.has-hover ? Palette.alternate-background : transparent;
+                                mta := TouchArea { }
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 1px;
+                                        Text {
+                                            text: m.name;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            color: #7a5a10;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: m.reason;
+                                            font-size: 11px;
+                                            opacity: 0.55;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    LinkButton {
+                                        label: "移除";
+                                        clicked => { root.missing-remove(index); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 设置：分组卷宗式（设计定稿 2026-11-05 方向 A）——
+                // 「目录」节 3 行紧凑路径 + 「热修改」节 pill 开关 + 两行效果说明。
+                // 开关文案不说「引擎模式」（用户不可理解），只说开/关各自效果。
+                if root.dlg-kind == 5 : VerticalLayout {
+                    spacing: 10px;
+                    vertical-stretch: 1;
+
+                    SettingsSection { name: "目录"; }
+                    SettingsRow {
+                        label: "存档目录";
+                        path <=> root.cfg-save-root;
+                        browse => { root.browse-dir(0); }
+                        open => { root.open-dir(0); }
+                    }
+                    SettingsRow {
+                        label: "本地 mod路径";
+                        path <=> root.cfg-local-mods;
+                        browse => { root.browse-dir(1); }
+                        open => { root.open-dir(1); }
+                    }
+                    SettingsRow {
+                        label: "steam mod路径";
+                        path <=> root.cfg-workshop;
+                        browse => { root.browse-dir(2); }
+                        open => { root.open-dir(2); }
+                    }
+
+                    SettingsSection { name: "热修改"; }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        HotapplySwitch {
+                            on: root.cfg-hotapply;
+                            toggled => { root.cfg-hotapply = !root.cfg-hotapply; }
+                        }
+                        Text {
+                            text: "启用热修改";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: root.cfg-hotapply
+                            ? "开：游戏运行中把修改直接注入游戏，应用后进存档即生效。"
+                            : "关：只写存档文件，改动在游戏下次读档时生效；游戏运行中修改会在退出时被覆盖，建议关游戏后再应用。";
+                        font-size: 12px;
+                        color: Palette.foreground;
+                        opacity: 0.7;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "路径留空 = 未配置；配置随「保存并重扫」生效（写在 exe 同目录 dd-mrm.json）。";
+                        font-size: 12px;
+                        color: Palette.foreground;
+                        opacity: 0.7;
+                        wrap: word-wrap;
+                    }
+                }
+
+                // 按钮排：动作钮居左（列表对话需选中才启用），取消钮恒可点居右；
+                // 取消钮回调下标 = dlg-buttons.length（取消项已由 Rust 侧从表末位摘出）。
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    for b[index] in root.dlg-buttons : PaperButton {
+                        label: b;
+                        danger: b == "全部移除" || b == "删除" || b == "清空" || b == "覆盖";
+                        enabled: !(root.dlg-kind == 4 && index == 0 && root.dlg-list-current < 0)
+                            && !(root.dlg-kind == 8 && index < 2 && root.dlg-list-current < 0);
+                        clicked => { root.dlg-button-clicked(index); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    if root.dlg-cancel-label != "" : PaperButton {
+                        label: root.dlg-cancel-label;
+                        clicked => { root.dlg-button-clicked(root.dlg-buttons.length); }
+                    }
+                }
+            }
+        }
+    }
+}

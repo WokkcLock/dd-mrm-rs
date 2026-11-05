@@ -1,0 +1,9 @@
+[package]
+name = "dson"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Darkest Dungeon DSON save codec (bit31-faithful, byte-identical round-trip) with dsoncli"
+
+# GC5: this crate (lib AND dsoncli bin) must stay std-only — no third-party
+# dependencies, hand-rolled arg parsing in dsoncli.

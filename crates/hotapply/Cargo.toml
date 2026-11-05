@@ -1,0 +1,29 @@
+[package]
+name = "hotapply"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "DdHotapply.dll injector and named-pipe client for in-game save hot-apply"
+
+# GC1: 独立 crate —— 不得依赖 dson / save。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 协议授权方 = native/DdHotapply.c（C DLL 保持不重写，GC2）。
+# 特性清单：裁定六项 + 实现必需的四项（进程枚举 ToolHelp / WriteProcessMemory 所在
+# Diagnostics_Debug / GetProcAddress 所在 LibraryLoader / OVERLAPPED 所在 System_IO），
+# 同一 windows crate 内的特性，非新增依赖 —— 见 task-4-report.md 偏差节。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+] }
