@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use crate::dll::{DllDiscoveryError, locate_dll};
-use crate::injector::{InjectOptions, ProcessTarget, process_running, try_inject_with};
+use crate::injector::{
+    InjectOptions, ProcessTarget, find_pid_by_name, process_running, try_inject_with,
+};
+use crate::locate::{self, Anchors};
 use crate::pipe::{
     EncodeError, MAX_ENTRIES, ModEntry, PipeClient, PipeError, Reply, Request, sanitize_state,
 };
@@ -211,6 +214,48 @@ impl HotapplyClient {
         self.finish(save_path, entries, outcome)
     }
 
+    /// 注入前定位游戏版本锚点：进程映像路径 → 读 exe → [`crate::locate`]。
+    /// 游戏没在跑（拿不到 pid）静默返回 None（调用方本就要先判 game_running）；
+    /// 其他任一步失败：日志一行 + None —— 不阻断注入，DLL 退回编译期
+    /// 默认值（默认也不匹配时以 frame pattern mismatch 干净退出，安全侧）。
+    fn locate_game_anchors(&self) -> Option<Anchors> {
+        let log_dir = self.resolve_log_dir();
+        let pid = find_pid_by_name(&ProcessTarget::Name(self.config.game_process.clone()))?;
+        let exe = match process_image_path(pid) {
+            Ok(p) => p,
+            Err(e) => {
+                log_tool_line(&log_dir, &format!("locate: image path failed: {e}"));
+                return None;
+            }
+        };
+        let bytes = match std::fs::read(&exe) {
+            Ok(b) => b,
+            Err(e) => {
+                log_tool_line(&log_dir, &format!("locate: read {}: {e}", exe.display()));
+                return None;
+            }
+        };
+        match locate::locate(&bytes) {
+            Ok(a) => {
+                log_tool_line(
+                    &log_dir,
+                    &format!(
+                        "locate ok: {} frame={:#x} vpush={:#x} persist={:#x}",
+                        exe.display(),
+                        a.frame_rva,
+                        a.vpush_rva,
+                        a.persist_rva
+                    ),
+                );
+                Some(a)
+            }
+            Err(e) => {
+                log_tool_line(&log_dir, &format!("locate failed on {}: {e}", exe.display()));
+                None
+            }
+        }
+    }
+
     /// 连不上时注入引擎：定位 DLL（覆盖或搜索序）→ 写 cfg → TryInject。
     /// 失败映射为旧 C# 的 engine-off / game-not-running / dll-not-found 档。
     fn ensure_injected(&self) -> Result<(), ApplyOutcome> {
@@ -223,10 +268,15 @@ impl HotapplyClient {
             })?,
         };
         let log_dir = self.resolve_log_dir();
+        // 注入前定位游戏版本锚点（进程映像路径 → 读 exe → locate）；
+        // 定位失败不阻断注入：记日志后传 None，DLL 走编译期默认值
+        // （默认值也不匹配时 DLL 会以 frame pattern mismatch 干净退出）。
+        let anchors = self.locate_game_anchors();
         let inject = try_inject_with(
             ProcessTarget::Name(self.config.game_process.clone()),
             &dll,
             &log_dir,
+            anchors.as_ref(),
             &InjectOptions {
                 thread_wait_ms: self.config.inject_thread_wait_ms,
             },
@@ -305,6 +355,32 @@ pub fn log_tool_line(log_dir: &std::path::Path, line: &str) {
         return;
     };
     let _ = writeln!(f, "{}Z tool: {line}", format_utc_now());
+}
+
+/// 进程主模块映像路径（QueryFullProcessImageNameW，只读查询权限）。
+fn process_image_path(pid: u32) -> Result<PathBuf, String> {
+    unsafe {
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| format!("open-process-err{}", crate::win::win32_code(&e)))?;
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(
+            h,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .map_err(|e| format!("query-image-err{}", crate::win::win32_code(&e)));
+        let _ = CloseHandle(h);
+        r?;
+        Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+    }
 }
 
 /// 当前时刻 → `YYYY-MM-DDTHH:MM:SS.mmmZ`（无 chrono 依赖的手写 UTC 格式化）。

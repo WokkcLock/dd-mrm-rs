@@ -4,6 +4,7 @@
 //! 模块布局（全部 windows-only）：
 //! - [`dll`]：DLL 定位（env → exe 目录 → eng/native → 仓库开发路径）
 //! - [`injector`]：CreateRemoteThread 注入（旧 C# NativeInjector 语义）
+//! - [`locate`]：游戏版本自适应 —— 从 exe 字节定位三锚点（参数化 v2）
 //! - [`pipe`]：`\\.\pipe\DdModToolHotapply` 行协议客户端
 //! - [`client`]：**T5 只消费这个门面**（`HotapplyClient::apply`）+ 重导出类型
 //! - [`verify`]：notepad 冒烟（= 旧 smoke.ps1）
@@ -24,6 +25,8 @@ pub mod dll;
 #[cfg(windows)]
 pub mod injector;
 #[cfg(windows)]
+pub mod locate;
+#[cfg(windows)]
 pub mod pipe;
 #[cfg(windows)]
 pub mod verify;
@@ -33,6 +36,8 @@ pub mod verify;
 pub use client::{ApplyOutcome, ClientConfig, DEFAULT_GAME_PROCESS, HotapplyClient};
 #[cfg(windows)]
 pub use injector::{InjectFailure, InjectOptions, ProcessTarget};
+#[cfg(windows)]
+pub use locate::{Anchors, LocateError};
 #[cfg(windows)]
 pub use pipe::{EncodeError, ModEntry, PipeError, Reply, Request};
 

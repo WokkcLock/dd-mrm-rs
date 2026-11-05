@@ -40,8 +40,27 @@ use crate::win::{wide_null, win32_code};
 pub const CFG_MAP_NAME: &str = r"Local\DdModToolHotapplyCfg";
 /// 配置映射大小（= DdHotapply.c / 旧 C# `WriteCfg`：1024 字节）。
 pub const CFG_MAP_SIZE: usize = 1024;
-/// logDir 宽串写入上限（含 NUL，1020 字节 = 510 个 wchar，同旧 C#）。
-const CFG_MAX_BYTES: usize = 1020;
+
+// ---- 配置块 v2 布局（DdHotapply.c `ReadCfg` 按同一布局解析）----
+// v1（旧 C# 与本工具 2026-11-05 前版本）：offset 0 起整块 UTF-16 logDir。
+// v2 起改为结构化头：锚点参数化——游戏更新后 Rust 侧重新定位三 RVA，
+// DLL 无需重编。DLL 见到不认识的 magic/version 一律走编译期默认值。
+pub const CFG_MAGIC: u32 = 0x5A4D_4444; // 字节序 44 44 4D 5A
+pub const CFG_VERSION: u32 = 2;
+/// flags bit0：三 RVA+pattern 字段有效（None 时不置位，DLL 用默认值）。
+pub const CFG_FLAG_HAS_ANCHORS: u32 = 1;
+const OFF_MAGIC: usize = 0;
+const OFF_VERSION: usize = 4;
+const OFF_FLAGS: usize = 8;
+const OFF_FRAME: usize = 12;
+const OFF_VPUSH: usize = 16;
+const OFF_PERSIST: usize = 20;
+const OFF_PATTERN: usize = 24; // 16 字节
+const OFF_LOGDIR_LEN: usize = 40; // UTF-16 码元数（不含 NUL）
+const OFF_LOGDIR: usize = 44; // UTF-16LE，剩余 (1024-44)/2 = 490 码元
+/// logDir 写入上限（含 NUL，码元数）。
+const CFG_LOGDIR_MAX_CHARS: usize = (CFG_MAP_SIZE - OFF_LOGDIR) / 2;
+
 /// 注入线程等待上限默认值（同旧 C# 的 5000ms）。
 pub const DEFAULT_INJECT_THREAD_WAIT_MS: u32 = 5_000;
 
@@ -127,26 +146,28 @@ unsafe impl Sync for SyncHandle {}
 
 static CFG_MAPPING: OnceLock<SyncHandle> = OnceLock::new();
 
-/// 注入入口（默认等待参数）。见 [`try_inject_with`]。
+/// 注入入口（默认等待参数、无锚点覆盖）。见 [`try_inject_with`]。
 pub fn try_inject(
     target: ProcessTarget,
     dll_path: &Path,
     log_dir: &Path,
 ) -> Result<(), InjectFailure> {
-    try_inject_with(target, dll_path, log_dir, &InjectOptions::default())
+    try_inject_with(target, dll_path, log_dir, None, &InjectOptions::default())
 }
 
 /// 注入入口（全参数）。dll_path 必须是**绝对路径**（LoadLibraryW 在目标进程解析）；
-/// log_dir 写进共享内存供 DLL 落日志。
+/// log_dir 写进共享内存供 DLL 落日志；anchors = 定位结果（游戏版本参数），
+/// Some 时 DLL 用它替换编译期默认 RVA/指纹，None 时 DLL 走默认值（如 notepad 冒烟）。
 pub fn try_inject_with(
     target: ProcessTarget,
     dll_path: &Path,
     log_dir: &Path,
+    anchors: Option<&crate::locate::Anchors>,
     opts: &InjectOptions,
 ) -> Result<(), InjectFailure> {
     let pid = resolve_pid(&target)?;
-    // 先写配置再注入：DLL 的 InitThread 第一步就 LogOpen 读它（顺序不可换）
-    write_cfg(log_dir);
+    // 先写配置再注入：DLL 的 InitThread 第一步就 ReadCfg/LogOpen 读它（顺序不可换）
+    write_cfg(log_dir, anchors);
 
     let access = PROCESS_ACCESS_RIGHTS(
         windows::Win32::System::Threading::PROCESS_CREATE_THREAD.0
@@ -311,10 +332,10 @@ fn inject_into(hproc: &HANDLE, dll_path: &Path, wait_ms: u32) -> Result<(), Inje
     }
 }
 
-/// 写共享内存配置（logDir 宽串，1024B 映射）。失败静默 —— 与旧 C# 一致：
-/// 写不进去最坏是 DLL 日志落回自己目录，不该阻断注入。幂等：首次创建后
-/// 复用同一映射，重写内容（多次注入换 log_dir 的场景）。
-pub fn write_cfg(log_dir: &Path) {
+/// 写共享内存配置（v2 结构化布局）。失败静默 —— 与旧 C# 一致：
+/// 写不进去最坏是 DLL 走编译期默认值、日志落回自己目录，不该阻断注入。
+/// 幂等：首次创建后复用同一映射，重写内容（多次注入换参数的场景）。
+pub fn write_cfg(log_dir: &Path, anchors: Option<&crate::locate::Anchors>) {
     let handle = CFG_MAPPING
         .get_or_init(|| {
             let created = unsafe {
@@ -334,19 +355,35 @@ pub fn write_cfg(log_dir: &Path) {
     if handle.is_invalid() {
         return;
     }
-    // 截到 CFG_MAX_BYTES 内（含 NUL，不劈开宽字符）
+    // logDir 截到容量内（含 NUL，不劈开宽字符）
     let mut wide: Vec<u16> = wide_null(&log_dir.to_string_lossy());
-    let max_chars = CFG_MAX_BYTES / 2;
-    if wide.len() > max_chars {
-        wide.truncate(max_chars);
+    if wide.len() > CFG_LOGDIR_MAX_CHARS {
+        wide.truncate(CFG_LOGDIR_MAX_CHARS);
         *wide.last_mut().unwrap() = 0;
     }
     unsafe {
         let view = MapViewOfFile(handle, FILE_MAP_WRITE, 0, 0, CFG_MAP_SIZE);
         if !view.Value.is_null() {
-            let buf = std::slice::from_raw_parts_mut(view.Value.cast::<u16>(), CFG_MAP_SIZE / 2);
+            let buf = std::slice::from_raw_parts_mut(view.Value.cast::<u8>(), CFG_MAP_SIZE);
             buf.fill(0);
-            buf[..wide.len()].copy_from_slice(&wide);
+            buf[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&CFG_MAGIC.to_le_bytes());
+            buf[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&CFG_VERSION.to_le_bytes());
+            let flags = if anchors.is_some() { CFG_FLAG_HAS_ANCHORS } else { 0 };
+            buf[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+            if let Some(a) = anchors {
+                buf[OFF_FRAME..OFF_FRAME + 4].copy_from_slice(&a.frame_rva.to_le_bytes());
+                buf[OFF_VPUSH..OFF_VPUSH + 4].copy_from_slice(&a.vpush_rva.to_le_bytes());
+                buf[OFF_PERSIST..OFF_PERSIST + 4].copy_from_slice(&a.persist_rva.to_le_bytes());
+                buf[OFF_PATTERN..OFF_PATTERN + 16].copy_from_slice(&a.frame_pattern);
+            }
+            // log_dir_len = 不含 NUL 的码元数（wide 末位是 NUL；DLL 侧按
+            // NUL 结尾宽串解析，len 只是冗余校验字段）
+            buf[OFF_LOGDIR_LEN..OFF_LOGDIR_LEN + 4]
+                .copy_from_slice(&((wide.len() - 1) as u32).to_le_bytes());
+            for (i, &ch) in wide.iter().enumerate() {
+                let off = OFF_LOGDIR + i * 2;
+                buf[off..off + 2].copy_from_slice(&ch.to_le_bytes());
+            }
             let _ = UnmapViewOfFile(view);
         }
     }
@@ -411,9 +448,32 @@ mod tests {
     fn write_cfg_creates_mapping_and_is_idempotent() {
         let tmp = std::env::temp_dir().join(format!("dd-mrm-ha-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        write_cfg(&tmp);
-        write_cfg(&tmp); // 二次写不 panic、不换映射
-        // DLL 视角验证：OpenFileMappingW(FILE_MAP_READ) 能读到同样内容
+        write_cfg(&tmp, None);
+        write_cfg(&tmp, None); // 二次写不 panic、不换映射
+        read_cfg_and_assert(&tmp, None);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn write_cfg_with_anchors_writes_layout() {
+        let tmp = std::env::temp_dir().join(format!("dd-mrm-ha-cfg2-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let anchors = crate::locate::Anchors {
+            frame_rva: 0x418AA0,
+            vpush_rva: 0x3F3810,
+            persist_rva: 0x41A430,
+            frame_pattern: [
+                0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10, 0x48, 0x89, 0x70, 0x18, 0x55, 0x57,
+                0x41, 0x56, 0x48,
+            ],
+        };
+        write_cfg(&tmp, Some(&anchors));
+        read_cfg_and_assert(&tmp, Some(&anchors));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// DLL 视角验证：OpenFileMappingW(FILE_MAP_READ) 读回，逐字段比对。
+    fn read_cfg_and_assert(log_dir: &std::path::Path, anchors: Option<&crate::locate::Anchors>) {
         unsafe {
             use windows::Win32::System::Memory::{FILE_MAP_READ, OpenFileMappingW};
             let name = wide_null(CFG_MAP_NAME);
@@ -425,13 +485,30 @@ mod tests {
                 !view.Value.is_null(),
                 "map view should be readable like the DLL does"
             );
-            let slice = std::slice::from_raw_parts(view.Value.cast::<u16>(), CFG_MAP_SIZE / 2);
-            let len = slice.iter().position(|&c| c == 0).unwrap();
-            let read_back = String::from_utf16_lossy(&slice[..len]);
-            assert_eq!(read_back, tmp.to_string_lossy());
+            let buf = std::slice::from_raw_parts(view.Value.cast::<u8>(), CFG_MAP_SIZE);
+            let u32_at = |off: usize| u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            assert_eq!(u32_at(OFF_MAGIC), CFG_MAGIC);
+            assert_eq!(u32_at(OFF_VERSION), CFG_VERSION);
+            match anchors {
+                Some(a) => {
+                    assert_eq!(u32_at(OFF_FLAGS), CFG_FLAG_HAS_ANCHORS);
+                    assert_eq!(u32_at(OFF_FRAME), a.frame_rva);
+                    assert_eq!(u32_at(OFF_VPUSH), a.vpush_rva);
+                    assert_eq!(u32_at(OFF_PERSIST), a.persist_rva);
+                    assert_eq!(&buf[OFF_PATTERN..OFF_PATTERN + 16], &a.frame_pattern);
+                }
+                None => assert_eq!(u32_at(OFF_FLAGS), 0),
+            }
+            let chars = u32_at(OFF_LOGDIR_LEN) as usize;
+            assert!(chars > 0 && chars <= CFG_LOGDIR_MAX_CHARS);
+            let mut units = Vec::with_capacity(chars);
+            for i in 0..chars {
+                let off = OFF_LOGDIR + i * 2;
+                units.push(u16::from_le_bytes([buf[off], buf[off + 1]]));
+            }
+            assert_eq!(String::from_utf16_lossy(&units), log_dir.to_string_lossy());
             let _ = UnmapViewOfFile(view);
             let _ = CloseHandle(handle);
         }
-        std::fs::remove_dir_all(&tmp).ok();
     }
 }

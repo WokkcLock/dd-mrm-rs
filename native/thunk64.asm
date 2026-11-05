@@ -1,6 +1,7 @@
 ; thunk64.asm - DdHotapply frame hook thunk (ASCII comments only: ml64 reads codepage 936)
-; Game frame function (sub_1403D93C0) entry 13 bytes are replaced with: jmp frame_thunk.
-; Save ALL volatile registers (x64 ABI: RAX RCX RDX R8-R11 + XMM0-5), call C side
+; Game frame function (sub_140418AA0, game build MD5 1c67048e) entry 13 bytes are replaced
+; with: jmp frame_thunk. Save ALL volatile registers (x64 ABI: RAX RCX RDX R8-R11 + XMM0-5),
+; stash RCX (frame this = estate screen object) into g_est, call C side
 ; frame_op (frame queue / apply), restore, then jump to frame_trampoline
 ; (trampoline = original 13-byte push prologue + jmp back to original+13, built at runtime by C).
 ; Stack: on entry [rsp]=return address, rsp%16==8; keep rsp%16==0 right before `call frame_op`.
@@ -8,8 +9,10 @@
 .code
 EXTERN frame_op:PROC
 EXTERN frame_trampoline:PROC
+EXTERN g_est:QWORD
 
 frame_thunk PROC
+    mov  g_est, rcx                ; capture frame this (estate screen) before anything
     sub  rsp, 8                    ; alignment pad
     push rax
     push rcx

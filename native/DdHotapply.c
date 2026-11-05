@@ -1,10 +1,13 @@
 // DdHotapply —— DdModTool 热应用原生引擎（v2.1 语义的 C 复刻，2026-11-04）。
 // 替代 frida 链：工具注入本 DLL → DLL 建命名管道服务器 + 帧钩（唯一钩点）→
-// 工具经管道发 apply → 帧间隙在游戏主线程执行官方链（清向量+sub_140562920 推入+sub_14040F5B0 落盘）。
+// 工具经管道发 apply → 帧间隙在游戏主线程执行官方链（清向量+fPush 推入+fPersist 落盘）。
 // 协议/常量/护栏与 Gui/eng/agent.js（frida 版，保留可回退）逐字对齐。
 // 安全设计：①先取管道句柄（被占=别的引擎在服务，干净退出不装钩）②FRAME 入口 16 字节模式校验
 // ③装钩期间冻结其余线程 ④apply 全程现读指针+bad-vector 护栏 ⑤无帧 2.5s 超时无副作用退出。
-// 游戏版本：Darkest.exe MD5 d1bd550c…（模式不符即拒载，不会写错版本）。
+// 游戏版本：编译期默认 = Darkest.exe MD5 1c67048e…（2026-11-05 Steam 更新版）。
+// v2 参数化：Rust 工具注入前对目标 exe 实时定位三 RVA + 指纹，经共享内存下发；
+// 模式校验仍兜底（定位错/未知版本 → 拒载不写，模式不符即拒载，不会写错版本）。
+// 屏对象不再走全局指针（旧 0x117D8B0）：帧函数每帧把 rcx（this=屏对象）存进 g_est。
 
 #include <windows.h>
 #include <stdio.h>
@@ -17,24 +20,51 @@
 #define PIPE_NAME   L"\\\\.\\pipe\\DdModToolHotapply"
 #define CFG_MAPNAME L"Local\\DdModToolHotapplyCfg"
 
-#define RVA_FRAME     0x3D93C0
-#define RVA_VPUSH     0x562920          // void  fPush(pg容器, 192B条目)
-#define RVA_PERSIST   0x40F5B0          // i64   fPersist(屏对象, uint 槽位)
-#define RVA_ESTPTR    0x117D8B0         // qword 地产屏全局指针
-#define OFF_ENVARRAY  5992              // 屏+5992 = 信封数组指针
+// ---- 参数化锚点（v2：游戏更新后由 Rust 侧 locate 重定位，经共享内存下发）----
+// 编译期默认 = 2026-11-05 Steam 更新版（MD5 1c67048e…）。配置块 magic/version
+// 不符或未置 HAS_ANCHORS → 用默认值（notepad 冒烟等无游戏宿主场景）。
+#define RVA_FRAME_DFLT 0x418AA0
+#define RVA_VPUSH_DFLT 0x3F3810          // void  fPush(applied容器, 192B条目)
+#define RVA_PERSIST_DFLT 0x41A430        // i64   fPersist(屏对象, uint 槽位)
+
+// 配置块 v2 布局（与 crates/hotapply/src/injector.rs 常量一一对应）
+#define CFG_MAGIC_V2   0x5A4D4444u       // 字节序 44 44 4D 5A
+#define CFG_VERSION_V2 2u
+#define CFG_FLAG_HAS_ANCHORS 1u
+#define CFG_OFF_MAGIC    0
+#define CFG_OFF_VERSION  4
+#define CFG_OFF_FLAGS    8
+#define CFG_OFF_FRAME   12
+#define CFG_OFF_VPUSH   16
+#define CFG_OFF_PERSIST 20
+#define CFG_OFF_PATTERN 24               // 16 字节
+#define CFG_OFF_LOGDIR  44               // UTF-16LE，NUL 结尾
+
+static DWORD g_rvaFrame  = RVA_FRAME_DFLT;   // ReadCfg 可覆盖
+static DWORD g_rvaVpush  = RVA_VPUSH_DFLT;
+static DWORD g_rvaPersist= RVA_PERSIST_DFLT;
+static int   g_anchorsFromCfg = 0;           // 日志自证来源
+
+#define OFF_ENVARRAY  5992              // 屏+5992(0x1768) = 信封数组指针
 #define ENV_SIZE      3088
-#define OFF_PG_BASE   328               // 信封+328 = PG base 容器
-#define OFF_VEC_BEGIN 520
-#define OFF_VEC_END   528
+#define OFF_PG_BASE   328               // 信封+328(0x148) = PG 对象头
+#define OFF_APPLIED   0x440             // PG+0x440 = applied_ugcs 容器对象头（1088 不变）
+#define OFF_VEC_BEGIN 0x208             // 容器+0x208 = vector begin（520 不变，基址从 PG 头改为 applied 容器头）
+#define OFF_VEC_END   0x210             // 容器+0x210 = vector end（528 不变）
 #define ENTRY_SIZE    192               // {title[128], version[64]}
 #define OFF_ENV_HASCAMP 325
 #define MAX_ENVS      9
 #define MAX_ENTRIES   128
-#define FRAME_PATCH_LEN 13              // push 序列长度（trampoline 原样复制）
+#define FRAME_PATCH_LEN 13              // 3+4+4+1+1=13B 恰好完整指令边界（trampoline 原样复制）
 
-// FRAME 入口 16 字节版本模式（2026-11-04 从本版 exe 提取；不符拒载）
-static const unsigned char FRAME_PATTERN[16] = {
-    0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8d,0xac };
+// FRAME 入口 16 字节版本模式（默认 = 1c67048e 版；ReadCfg 可覆盖）
+static const unsigned char FRAME_PATTERN_DFLT[16] = {
+    0x48,0x8b,0xc4,0x48,0x89,0x58,0x10,0x48,0x89,0x70,0x18,0x55,0x57,0x41,0x56,0x48 };
+static unsigned char g_framePattern[16];     // init: 默认值 → cfg 覆盖
+#define PATTERN_LEN 16
+
+// DLL 版本标识：init 日志自证注入的是哪一版（旧版无此串，一眼区分）
+#define DLL_BUILD_TAG "2026-11-05f parametric"
 
 typedef void      (*fn_push)(void*, void*);
 typedef long long (*fn_persist)(void*, unsigned int);
@@ -43,18 +73,48 @@ static unsigned char* g_base = NULL;    // Darkest.exe 基址
 static fn_push    g_fPush    = NULL;
 static fn_persist g_fPersist = NULL;
 
-// ---------------- 日志 ----------------
+// 屏对象（帧函数 this）：thunk64.asm 每帧进入时直写 rcx → 此变量。
+// 不能 static：asm 需要外部符号。case22 重建屏后下一帧自动换新值。
+void* volatile g_est = NULL;
+
+// ---------------- 配置读取（v2 结构化） ----------------
+
 static CRITICAL_SECTION g_logCS;
 static wchar_t g_logDir[MAX_PATH] = L"";
 static HANDLE g_logFile = INVALID_HANDLE_VALUE;
 
-static void LogOpen(void) {
+static unsigned u32le(const unsigned char* p) { return p[0] | p[1]<<8 | p[2]<<16 | (unsigned)p[3]<<24; }
+
+// 读共享内存配置：锚点参数 + logDir。v2 布局见 injector.rs；magic/version 不符
+// → 按旧 v1 语义把 offset 0 当纯宽串 logDir（锚点保持默认，安全侧）。
+static void ReadCfg(void) {
+    memcpy(g_framePattern, FRAME_PATTERN_DFLT, PATTERN_LEN);
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, CFG_MAPNAME);
-    if (hMap) {
-        wchar_t* p = (wchar_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-        if (p) { wcsncpy_s(g_logDir, MAX_PATH, p, _TRUNCATE); UnmapViewOfFile(p); }
-        CloseHandle(hMap);
+    if (!hMap) return;
+    unsigned char* p = (unsigned char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!p) { CloseHandle(hMap); return; }
+
+    if (u32le(p + CFG_OFF_MAGIC) == CFG_MAGIC_V2 && u32le(p + CFG_OFF_VERSION) == CFG_VERSION_V2) {
+        if (u32le(p + CFG_OFF_FLAGS) & CFG_FLAG_HAS_ANCHORS) {
+            g_rvaFrame   = u32le(p + CFG_OFF_FRAME);
+            g_rvaVpush   = u32le(p + CFG_OFF_VPUSH);
+            g_rvaPersist = u32le(p + CFG_OFF_PERSIST);
+            memcpy(g_framePattern, p + CFG_OFF_PATTERN, PATTERN_LEN);
+            g_anchorsFromCfg = 1;
+        }
+        wchar_t dir[MAX_PATH];
+        wcsncpy_s(dir, MAX_PATH, (wchar_t*)(p + CFG_OFF_LOGDIR), (1024 - CFG_OFF_LOGDIR) / 2);
+        wcsncpy_s(g_logDir, MAX_PATH, dir, _TRUNCATE);
+    } else {
+        // v1（旧工具/旧 C#）：整块 UTF-16 logDir
+        wcsncpy_s(g_logDir, MAX_PATH, (wchar_t*)p, 1024 / 2);
     }
+    UnmapViewOfFile(p);
+    CloseHandle(hMap);
+}
+
+static void LogOpen(void) {
+    ReadCfg();
     if (!g_logDir[0]) {
         // 回退：日志写在 DLL 自己旁边（注入器没给目录时的可见性兜底）
         HMODULE hSelf;
@@ -251,8 +311,8 @@ static void DoApply(Op* op) {
     const char* profile = op->profile;
     op->ok = 0; op->count = 0; op->persisted = 0;
 
-    // ① 现读屏对象（不缓存；case22 会重建）
-    void* est = *(void**)(g_base + RVA_ESTPTR);
+    // ① 现读屏对象（帧钩每帧存的 rcx；case22 重建后下一帧自动更新）
+    void* est = (void*)g_est;
     if (!est) { strcpy_s(op->state, _countof(op->state), "not-at-list"); return; }
     unsigned char* envBase = *(unsigned char**)((unsigned char*)est + OFF_ENVARRAY);
     if (!envBase) { strcpy_s(op->state, _countof(op->state), "no-envelope-array"); return; }
@@ -282,9 +342,9 @@ static void DoApply(Op* op) {
         return;
     }
 
-    unsigned char* pg = env + OFF_PG_BASE;
-    unsigned char* begin = *(unsigned char**)(pg + OFF_VEC_BEGIN);
-    unsigned char* end   = *(unsigned char**)(pg + OFF_VEC_END);
+    unsigned char* container = env + OFF_PG_BASE + OFF_APPLIED;   // applied_ugcs 容器对象头
+    unsigned char* begin = *(unsigned char**)(container + OFF_VEC_BEGIN);
+    unsigned char* end   = *(unsigned char**)(container + OFF_VEC_END);
     long long span = (long long)(end - begin);
     // begin=end=NULL 是合法空向量：清空档的 persist.game.json 无 applied_ugcs 字段，
     // 列表重建重读后容器从未推过条目（游戏自己造出的状态）
@@ -298,19 +358,19 @@ static void DoApply(Op* op) {
     int hadCampaign = env[OFF_ENV_HASCAMP] != 0;
 
     // ③ 官方清空：end = begin（不释放容量；192B POD 条目无析构）
-    *(void**)(pg + OFF_VEC_END) = begin;
+    *(void**)(container + OFF_VEC_END) = begin;
 
-    // ④ 官方推入：逐条 sub_140562920(容器, 条目)；增长/查重/分配在游戏自己代码里
+    // ④ 官方推入：逐条 fPush(容器, 条目)；增长/查重/分配在游戏自己代码里
     unsigned char scratch[ENTRY_SIZE];
     for (int i = 0; i < op->n; i++) {
         memset(scratch, 0, sizeof scratch);
         utf8_trunc_copy((char*)scratch,        128, op->ents[i].title);    // title[128]（含 NUL 位）
         utf8_trunc_copy((char*)scratch + 128,   64, op->ents[i].version);  // version[64]
-        g_fPush(pg, scratch);
+        g_fPush(container, scratch);
     }
     // 空向量首推时游戏会更新 begin（NULL→新分配），重读再算
-    begin = *(unsigned char**)(pg + OFF_VEC_BEGIN);
-    unsigned char* newEnd = *(unsigned char**)(pg + OFF_VEC_END);
+    begin = *(unsigned char**)(container + OFF_VEC_BEGIN);
+    unsigned char* newEnd = *(unsigned char**)(container + OFF_VEC_END);
     op->count = (int)((long long)(newEnd - begin) / ENTRY_SIZE);
 
     // ⑤ 官方落盘（内含 !demo && env+325 守卫；无战役时跳过，内存补丁仍成立）
@@ -370,7 +430,7 @@ static void ResumeThreads(HANDLE* hArr, int n) {
 }
 
 static int InstallFrameHook(void) {
-    unsigned char* target = g_base + RVA_FRAME;
+    unsigned char* target = g_base + g_rvaFrame;
     DWORD oldp;
     // trampoline：原 13 字节 push 序列 + mov rax,imm64;jmp rax（回原+13）
     memcpy(frame_trampoline, target, FRAME_PATCH_LEN);
@@ -497,27 +557,58 @@ static DWORD WINAPI PipeThread(LPVOID pipeParam) {
 static DWORD WINAPI InitThread(LPVOID hModule) {
     InitializeCriticalSection(&g_logCS);
     LogOpen();
-    Log("init enter");
+    Log("init enter (%s)", DLL_BUILD_TAG);
 
     HMODULE exe = GetModuleHandleW(NULL);
     g_base = (unsigned char*)exe;
-    g_fPush    = (fn_push)(g_base + RVA_VPUSH);
-    g_fPersist = (fn_persist)(g_base + RVA_PERSIST);
 
     IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)exe;
     IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_base + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) { Log("fatal: bad PE"); goto quit; }
 
+    // 锚点来源自证（cfg = Rust locate 实时定位；built-in = 编译期默认值）
+    Log("anchors: %s frame=0x%lX vpush=0x%lX persist=0x%lX",
+        g_anchorsFromCfg ? "cfg" : "built-in",
+        (unsigned long)g_rvaFrame, (unsigned long)g_rvaVpush, (unsigned long)g_rvaPersist);
+
+    // 配置错乱防护：任一 RVA 越出模块映像 → 拒载（不装钩不建管道）。
+    // 文案并 frame-pattern-mismatch 家族：此时无从校验指纹，本质是同一类
+    // 「目标模块对不上」拒载（notepad 小宿主也走这里，verify 冒烟契约不变）。
+    if (g_rvaFrame >= nt->OptionalHeader.SizeOfImage ||
+        g_rvaVpush >= nt->OptionalHeader.SizeOfImage ||
+        g_rvaPersist >= nt->OptionalHeader.SizeOfImage) {
+        Log("fatal: frame pattern mismatch: rva beyond image (%s anchors, SizeOfImage=0x%X)",
+            g_anchorsFromCfg ? "cfg" : "built-in", nt->OptionalHeader.SizeOfImage);
+        goto quit;
+    }
+    g_fPush    = (fn_push)(g_base + g_rvaVpush);
+    g_fPersist = (fn_persist)(g_base + g_rvaPersist);
+
     // 版本校验：FRAME 入口 16 字节模式（只读，无副作用）
     // 先 VirtualQuery 确认页面已提交（小宿主进程里 RVA 越界读会 AV）
     {
         MEMORY_BASIC_INFORMATION mbi;
-        SIZE_T need = RVA_FRAME + sizeof FRAME_PATTERN;
-        if (!VirtualQuery(g_base + RVA_FRAME, &mbi, sizeof mbi) ||
+        SIZE_T need = g_rvaFrame + PATTERN_LEN;
+        if (!VirtualQuery(g_base + g_rvaFrame, &mbi, sizeof mbi) ||
             mbi.State != MEM_COMMIT ||
-            (SIZE_T)((unsigned char*)mbi.BaseAddress + mbi.RegionSize - (g_base + RVA_FRAME)) < need ||
-            memcmp(g_base + RVA_FRAME, FRAME_PATTERN, sizeof FRAME_PATTERN) != 0) {
+            (SIZE_T)((unsigned char*)mbi.BaseAddress + mbi.RegionSize - (g_base + g_rvaFrame)) < need) {
+            Log("fatal: frame pattern mismatch: page not committed at RVA 0x%llX (small host or version changed?)",
+                (unsigned long long)g_rvaFrame);
+            goto quit;
+        }
+        if (memcmp(g_base + g_rvaFrame, g_framePattern, PATTERN_LEN) != 0) {
+            // 版本差异落盘：期望/实际字节 + 模块尺寸，供离线比对定位版本
+            char exp[3 * PATTERN_LEN + 1], act[3 * PATTERN_LEN + 1];
+            for (int i = 0; i < PATTERN_LEN; i++) {
+                sprintf_s(exp + i * 3, 4, "%02x ", g_framePattern[i]);
+                sprintf_s(act + i * 3, 4, "%02x ", g_base[g_rvaFrame + i]);
+            }
+            exp[3 * PATTERN_LEN - 1] = 0;
+            act[3 * PATTERN_LEN - 1] = 0;
             Log("fatal: frame pattern mismatch (game version changed?)");
+            Log("  base=%p SizeOfImage=0x%X", g_base, nt->OptionalHeader.SizeOfImage);
+            Log("  expected: %s", exp);
+            Log("  actual  : %s", act);
             goto quit;
         }
     }

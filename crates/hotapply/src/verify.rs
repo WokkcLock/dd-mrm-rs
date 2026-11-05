@@ -1,7 +1,7 @@
 //! verify-inject：无游戏的注入冒烟（= 旧 native/smoke.ps1 的 Rust 移植）。
 //!
 //! 流程：起 notepad → 注入真实 DLL → notepad 没有 DdHotapply 引擎的特征码
-//! （FRAME_PATTERN@RVA 0x3D93C0），DLL 在 init 里记
+//! （FRAME_PATTERN@RVA 0x418AA0，游戏构建 1c67048e），DLL 在 init 里记
 //! `fatal: frame pattern mismatch` 后**干净退出**（不崩宿主、不建管道）——
 //! 这正是通过条件。断言：
 //! 1. 日志出现 `init enter`（注入+日志链路通）
@@ -86,11 +86,13 @@ fn watch_child(
     }
     std::thread::sleep(Duration::from_millis(300));
 
-    // cfg（logDir）先于注入写入 —— try_inject_with 内部处理
+    // cfg（logDir）先于注入写入 —— try_inject_with 内部处理。
+    // notepad 宿主无游戏锚点 → anchors=None，DLL 走编译期默认值路径。
     let inject = try_inject_with(
         ProcessTarget::Pid(child.id()),
         dll_path,
         log_dir,
+        None,
         &InjectOptions::default(),
     );
     let inject_ok = inject.is_ok();
