@@ -12,17 +12,16 @@ use std::time::Duration;
 
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 
-use hotapply::{ClientConfig, HotapplyClient, ModEntry};
+use hotapply::{ensure_hooked, game_running};
 use save::{
     AppliedMod, ApplyOptions, Estate, EstateFile, ModInfo, ModSource, Presets, SaveError,
     SaveRoots, apply_offline, backup_estate_dir, clean_old_backups, discover_estates, scan_mod_dir,
 };
 
 use crate::model::{
-    self, AppConfig, AppliedRow, HotapplyVerdict, applied_from_mod, classify_hotapply,
-    display_title, dlc_names, file_only_game_running_text, file_only_ok_text, filter_indices,
-    game_mode_cn, hotapply_fail_text, hotapply_ok_text, is_dirty, mark_present, not_at_list_text,
-    offline_fallback_text, pipe_entry, sanitize_detail, source_cn,
+    self, AppConfig, AppliedRow, applied_from_mod, display_title, dlc_names,
+    file_only_game_running_text, file_only_ok_text, filter_indices, game_mode_cn,
+    hotapply_ritual_text, is_dirty, mark_present, offline_fallback_text, source_cn,
 };
 
 slint::include_modules!();
@@ -1638,35 +1637,20 @@ fn rescan(app: &AppWindow, st: &State) {
 
 fn refresh_game_state(weak: Weak<AppWindow>, hotapply: bool) {
     std::thread::spawn(move || {
-        let cfg = ClientConfig {
-            log_dir: Some(model::exe_dir().join(LOG_DIR_NAME)),
-            ..Default::default()
-        };
-        let client = HotapplyClient::with_config(cfg);
-        let running = client.game_running();
-        // 热修改关闭时「引擎已接入」无意义（不会再被使用）——文案与状态栏 kind 一并降级。
-        let ready = hotapply && running && client.engine_ready();
-        let text: &'static str = match (running, ready) {
-            (true, true) => "🎮 游戏运行中 · 引擎已接入",
-            (true, false) => {
-                if hotapply {
-                    "🎮 游戏运行中 · 引擎未接入"
-                } else {
-                    "🎮 游戏运行中 · 热修改已关闭"
-                }
-            }
+        let running = game_running();
+        // B 路线：UI 与 DLL 零通信，「引擎接入」概念退役；守卫在应用动作时
+        // 现场挂载。状态栏只报进程存活。
+        let text: &'static str = match (running, hotapply) {
+            (true, true) => "🎮 游戏运行中 · 应用时自动挂守卫",
+            (true, false) => "🎮 游戏运行中 · 热修改已关闭",
             (false, _) => "游戏未运行",
         };
         let _ = weak.upgrade_in_event_loop(move |app| {
             app.set_game_state_text(text.into());
-            // 状态栏 kind 联动：引擎就绪 → 1（accent 强调「可热应用」）；
-            // 未就绪仅回收 kind 1，不打扰 2 应用中 / 3 结果态。
-            if !app.get_applying() {
-                if ready {
-                    app.set_status_kind(1);
-                } else if app.get_status_kind() == 1 {
-                    app.set_status_kind(0);
-                }
+            // 引擎就绪态（kind 1）已不存在；仅回收历史 1 值，不打扰
+            // 2 应用中 / 3 结果态。
+            if !app.get_applying() && app.get_status_kind() == 1 {
+                app.set_status_kind(0);
             }
         });
     });
@@ -2085,7 +2069,7 @@ fn apply_settings(app: &AppWindow, st: &State) {
 /// 备份永远先行（旧 BackupManager.BackupSave）；失败 → 三选一弹窗（ruling：
 /// 同秒同名备份 Err 是旧工具 parity，捕获后披露，不崩溃）。
 fn start_apply(app: &AppWindow, st: &State, estate_idx: usize, skip_backup: bool) {
-    let (persist, dir, label, mods, savebak, hot) = {
+    let (persist, dir, label, mods, savebak, hot, save_root) = {
         let mut s = st_lock(st);
         if s.applying {
             return;
@@ -2105,8 +2089,9 @@ fn start_apply(app: &AppWindow, st: &State, estate_idx: usize, skip_backup: bool
         let mods: Vec<AppliedMod> = s.applied.iter().map(|r| r.to_applied()).collect();
         let savebak = s.savebak.clone();
         let hot = s.cfg.hotapply;
+        let save_root = s.cfg.roots.save_root.clone();
         s.applying = true;
-        (persist, dir, label, mods, savebak, hot)
+        (persist, dir, label, mods, savebak, hot, save_root)
     };
     app.set_applying(true);
     set_status(app, "正在应用…", 2);
@@ -2132,6 +2117,7 @@ fn start_apply(app: &AppWindow, st: &State, estate_idx: usize, skip_backup: bool
                 mods,
                 savebak,
                 hot,
+                save_root,
             );
         }));
         if let Err(panic) = outcome {
@@ -2167,14 +2153,9 @@ fn apply_worker(
     mods: Vec<AppliedMod>,
     savebak: std::path::PathBuf,
     hotapply: bool,
+    save_root: Option<std::path::PathBuf>,
 ) {
-    let cfg = ClientConfig {
-        log_dir: Some(model::exe_dir().join(LOG_DIR_NAME)),
-        ..Default::default()
-    };
-    let client = HotapplyClient::with_config(cfg);
-    let game_running = client.game_running();
-
+    let running = game_running();
     if !skip_backup && let Err(e) = backup_estate_dir(&dir, &label, &savebak) {
         finish_apply(
             weak,
@@ -2185,11 +2166,17 @@ fn apply_worker(
         return;
     }
 
-    if !hotapply {
-        // 设置开关关闭热修改（设计定稿 2026-11-05）：纯文件写盘，不接引擎；
-        // 已在运行的引擎进程不杀，只是绕过。游戏运行中写盘会被退出写回覆盖 → 警告文案。
+    // B 路线（v14）：守卫挂不上就不写盘——游戏运行中裸写存档，若本会话游戏
+    // 已读过该文件，陈旧 size 缓存会在下次读档时撞断言（E1c 定案）。游戏未
+    // 运行则零风险：冷启动读盘拿到的必然是新文件。
+    // TOCTOU 补哨：备份 zip 窗口内游戏可能刚启动（启动读 persist 会种下陈旧
+    // size 缓存）——写盘前重查进程，已启动同样走挂守卫路径。
+    let hot_path = hotapply && (running || game_running());
+    if !hot_path {
         let r = apply_offline(&persist, &mods, &ApplyOptions { backup_dir: None });
-        let text = if game_running {
+        let text = if hotapply {
+            offline_fallback_text()
+        } else if running {
             file_only_game_running_text()
         } else {
             file_only_ok_text()
@@ -2198,74 +2185,24 @@ fn apply_worker(
         return;
     }
 
-    if game_running {
-        hotapply_and_finish(&client, &persist, &mods, weak, st2, estate_idx);
-    } else if !client.game_running() {
-        // 离线路径（FR4）：顶层已按需备份（上方）；这里传 None——
-        // apply_offline(Some) 会再备份一次，同秒同名 zip 撞"已存在"守卫
-        // （backup.rs 拒绝已存在路径）→ 必现 BackupFail。备份一次/应用。
-        let r = apply_offline(&persist, &mods, &ApplyOptions { backup_dir: None });
-        let text = offline_fallback_text(None);
-        finish_apply(weak, st2, estate_idx, offline_msg(r, text));
-    } else {
-        // TOCTOU 补哨（game-re-facts §4 stale-cache）：备份 zip 窗口内游戏可能
-        // 刚刚启动 —— 启动时读取 persist 会让游戏 FS 缓存旧文件大小，此刻离线
-        // 原子替换再进档就是缓存失配的崩溃路径。写盘前重查进程：已运行 → 改走
-        // 热应用（由引擎在游戏进程内写盘，绕开缓存）。
-        hotapply_and_finish(&client, &persist, &mods, weak, st2, estate_idx);
-    }
-}
-
-/// 热应用路径（工作线程内执行）：条目预检 → pipe apply → 分类收尾。
-/// 引擎报 game-not-running 时自动离线回退（备份已由调用方按需完成 → backup_dir None）。
-fn hotapply_and_finish(
-    client: &HotapplyClient,
-    persist: &std::path::Path,
-    mods: &[AppliedMod],
-    weak: &Weak<AppWindow>,
-    st: &State,
-    estate_idx: usize,
-) {
-    // 条目先过管道校验（裸 { } 会破坏 DLL 解析；
-    // 超 127/63 字节会被 DLL 静默截断 —— 发送前拒绝并披露）。
-    //
-    // to_string_lossy 无害：DLL 只用 ASCII 子串定位 `profile_<数字>`，
-    // 路径中的非 ASCII 字节（中文用户名等）原样透传，U+FFFD 替换不参与匹配。
-    let persist_str = persist.to_string_lossy().into_owned();
-    let entries: Vec<ModEntry> = mods.iter().map(pipe_entry).collect();
-    for ent in &entries {
-        if let Err(reason) = ent
-            .check_pipe_safe()
-            .and_then(|()| ent.check_entry_capacity())
-        {
-            finish_apply(
-                weak,
-                st,
-                estate_idx,
-                ApplyMsg::Error(format!(
-                    "模组条目无法通过管道校验（{reason}），已中止热应用。"
-                )),
-            );
-            return;
-        }
-    }
-    let out = client.apply(&persist_str, &entries);
-    let terminal = match classify_hotapply(out.ok, &out.state) {
-        // committed = 存档态确实已落定（热应用成功），仅此时允许基线更新；
-        // NotAtList/Fail 磁盘未写，文案自称"未修改任何内容"——基线必须保持旧值。
-        HotapplyVerdict::Ok => Some((hotapply_ok_text(&out.state), true)),
-        HotapplyVerdict::NotAtList => Some((not_at_list_text(), false)),
-        HotapplyVerdict::Fail => Some((hotapply_fail_text(&sanitize_detail(&out.state)), false)),
-        HotapplyVerdict::OfflineFallback => None, // 自动离线回退（旧 CoverSave）
-    };
-    if let Some((text, committed)) = terminal {
-        finish_apply(weak, st, estate_idx, ApplyMsg::Status { text, committed });
+    let log_dir = model::exe_dir().join(LOG_DIR_NAME);
+    if let Err(e) = ensure_hooked(&log_dir, save_root.as_deref()) {
+        finish_apply(
+            weak,
+            st2,
+            estate_idx,
+            ApplyMsg::Error(format!(
+                "{}。已中止（未写存档）——可重试，或关闭游戏后再应用。",
+                e.detail()
+            )),
+        );
         return;
     }
-    // 引擎侧刚报 game-not-running：离线写盘（备份已在开头做过）。
-    let r = apply_offline(persist, mods, &ApplyOptions { backup_dir: None });
-    let text = offline_fallback_text(Some(&out.state));
-    finish_apply(weak, st, estate_idx, offline_msg(r, text));
+    // 守卫已挂：离线原子写盘 + 仪式指引（重看开场动画触发 refresh，守卫在
+    // size 查询处对齐磁盘真值，游戏读到新内容）。
+    let r = apply_offline(&persist, &mods, &ApplyOptions { backup_dir: None });
+    let text = hotapply_ritual_text();
+    finish_apply(weak, st2, estate_idx, offline_msg(r, text));
 }
 
 fn offline_msg(r: save::Result<save::ApplyOutcome>, text: String) -> ApplyMsg {

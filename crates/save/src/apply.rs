@@ -274,15 +274,37 @@ pub fn write_persist_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// 通用原子写：`{path}.tmp` → rename（Windows 上 `fs::rename` 即
-/// `MoveFileEx(..., REPLACE_EXISTING)`）。rename 失败重试 ≤10×100ms。
+/// `MoveFileEx(..., REPLACE_EXISTING)`）。写 tmp 与 rename 均重试 ≤10×100ms。
 ///
 /// 旧 C# DumpMeta 的重试被其 `finally` 中的 tmp 删除破坏（每次失败都把
 /// tmp 删了，重试形同虚设）；此处按其**意图**实现：重试期间保留 tmp，
 /// 只有最终放弃时才清理，并报告最后一次错误。
+///
+/// 写 tmp 也可能瞬时被拒（2026-11-10 实测：游戏运行窗口内对 Steam
+/// userdata 目录新建 `persist.game.json.tmp` 报拒绝访问，数秒后同操作
+/// 成功——Defender 实时扫描/Steam Cloud 同步短暂占名），故与 rename
+/// 同款重试。
 pub(crate) fn atomic_write_raw(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tmp: PathBuf = path.as_os_str().to_os_string().into();
     tmp.as_mut_os_string().push(".tmp");
-    fs::write(&tmp, bytes).map_err(|e| SaveError::io(&tmp, e))?;
+
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..RENAME_RETRIES {
+        match fs::write(&tmp, bytes) {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                sleep(RENAME_RETRY_DELAY);
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        let _ = fs::remove_file(&tmp); // 保险清理（多数情况下 tmp 未建成）
+        return Err(SaveError::io(&tmp, e));
+    }
 
     let mut last_err: Option<std::io::Error> = None;
     for _ in 0..RENAME_RETRIES {

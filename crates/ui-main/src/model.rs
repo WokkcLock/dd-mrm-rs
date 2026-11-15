@@ -1,18 +1,14 @@
-//! UI 无关的核心模型：条目映射（ModInfo ↔ ModEntry ↔ AppliedMod）、脏状态跟踪、
-//! 热应用状态串分类、配置 dd-mrm.json 读写、显示格式化（中文文案、净化）。
+//! UI 无关的核心模型：条目映射（ModInfo ↔ AppliedMod）、脏状态跟踪、
+//! B 路线热应用文案、配置 dd-mrm.json 读写、显示格式化（中文文案）。
 //!
 //! 全部为纯函数 / 纯数据结构，可脱离 slint 事件循环做单元测试（任务 5 交付项 5）。
 //!
-//! 关键语义（与旧 C# 工具逐字节对齐，见任务简报 ruling 4）：
+//! 关键语义（与旧 C# 工具对齐，见任务简报 ruling 4）：
 //!
-//! - 管道 `ModEntry { title, version }` = `(mod.Name, mod.Source)`：
-//!   title = applied 名，version = DSON source 字面量（`mod_local_source` / `Steam`），
-//!   对应旧 IndexViewModel.cs:523-525 的元组构造；
 //! - applied 名映射（IndexViewModel.cs:505-513）：本地 mod → title，创意工坊 → dir_name。
 
 use std::path::{Path, PathBuf};
 
-use hotapply::ModEntry;
 use save::{AppliedMod, DlcEntry, ModInfo, ModSource, SaveRoots};
 
 /// dd-mrm.json 里预设文件的默认路径（exe 同目录 presets.json）。
@@ -129,15 +125,6 @@ pub fn applied_from_mod(m: &ModInfo) -> AppliedMod {
     }
 }
 
-/// AppliedMod → 管道 ModEntry：旧工具逐字节口径（IndexViewModel.cs:523-525）。
-/// title = mod 名，version = DSON source 字面量（`mod_local_source` / `Steam`）。
-pub fn pipe_entry(a: &AppliedMod) -> ModEntry {
-    ModEntry {
-        title: a.name.clone(),
-        version: a.source.as_dson_str().to_string(),
-    }
-}
-
 /// 脏判定：当前编辑列表 vs 存档文件基线（顺序敏感 —— 顺序即应用顺序，FR3）。
 pub fn is_dirty(baseline: &[AppliedMod], current: &[AppliedRow]) -> bool {
     if baseline.len() != current.len() {
@@ -183,57 +170,16 @@ pub fn filter_indices(mods: &[ModInfo], query: &str, applied: &[AppliedRow]) -> 
         .collect()
 }
 
-/// 热应用结果分类（FR9 四态 + 旧 C# 行为对齐 IndexViewModel.cs:530-560）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HotapplyVerdict {
-    /// ok=true：已在游戏内存中生效。
-    Ok,
-    /// 引擎报告 game-not-running：自动回退离线写盘（旧工具 CoverSave 同款）。
-    OfflineFallback,
-    /// not-at-list：游戏正在该存档内，需要用户退回存档列表。
-    NotAtList,
-    /// 其余失败（含 engine-off:* / timeout / bad-* 等），state 原样展示。
-    Fail,
+/// B 路线（v14）热路径成功文案：存档已写 + size 守卫已挂。
+/// 仪式指引 = E1d/E1e 实验定案的生效路径：重看开场动画触发 refresh（site2），
+/// 守卫在 size 查询处对齐磁盘真值，卡片/存档读取拿到新内容。
+pub fn hotapply_ritual_text() -> String {
+    "✅已写入存档（游戏运行中，size 守卫已挂）。请退到主菜单，在任一战役卡上重看开场动画，回到存档列表后进入该存档即可生效。".to_string()
 }
 
-/// ok 驱动图标；state 串原样保留（简报要求 verbatim 展示）。
-pub fn classify_hotapply(ok: bool, state: &str) -> HotapplyVerdict {
-    if ok {
-        HotapplyVerdict::Ok
-    } else {
-        match state {
-            "game-not-running" => HotapplyVerdict::OfflineFallback,
-            "not-at-list" => HotapplyVerdict::NotAtList,
-            _ => HotapplyVerdict::Fail,
-        }
-    }
-}
-
-/// 热应用成功的状态栏文案（旧工具口径）。
-pub fn hotapply_ok_text(state: &str) -> String {
-    if state == "applied" {
-        "✅已热应用。直接进入该存档即生效；再改请先退到存档列表。".to_string()
-    } else {
-        format!("✅已热应用（{state}）。")
-    }
-}
-
-/// not-at-list 的警示文案（旧工具逐字口径）。
-pub fn not_at_list_text() -> String {
-    "⚠️游戏正在该存档内。请先退到存档列表再点应用，否则退出存档时会被覆盖。".to_string()
-}
-
-/// 其余热应用失败的文案（旧工具口径；state 已净化）。
-pub fn hotapply_fail_text(state: &str) -> String {
-    format!("⚠️热应用失败（{state}），未修改任何内容；可重试，或关闭游戏后应用。")
-}
-
-/// 离线回退成功的两种文案（游戏未运行 / 引擎未接入，均旧工具口径）。
-pub fn offline_fallback_text(engine_state: Option<&str>) -> String {
-    match engine_state {
-        None => "✅已写入存档（游戏未运行）。".to_string(),
-        Some(s) => format!("✅已写入存档（游戏未运行，引擎未接入：{s}）。"),
-    }
+/// 离线回退成功文案（游戏未运行；旧工具口径）。
+pub fn offline_fallback_text() -> String {
+    "✅已写入存档（游戏未运行）。".to_string()
 }
 
 /// 热修改关闭（设置开关）时的写盘成功文案。设计定稿 2026-11-05（比稿 2E：仅文案区分）。
@@ -244,26 +190,6 @@ pub fn file_only_ok_text() -> String {
 /// 热修改关闭但游戏正在运行：写盘会在游戏退出时被覆盖，警告文案。
 pub fn file_only_game_running_text() -> String {
     "⚠️已写入文件，但游戏正在运行——退出时游戏会覆盖本次修改，建议关闭游戏后再应用。".to_string()
-}
-
-/// 失败细节净化（旧 C# CleanState 口径）：控制字符 → `?`，超过 160 字符截断加 `…`。
-pub fn sanitize_detail(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| {
-            if (c as u32) < 0x20 || c as u32 == 0x7f {
-                '?'
-            } else {
-                c
-            }
-        })
-        .collect();
-    if cleaned.chars().count() > 160 {
-        let head: String = cleaned.chars().take(160).collect();
-        format!("{head}…")
-    } else {
-        cleaned
-    }
 }
 
 /// game_mode → 中文（旧 IndexViewModel.cs:85-91 口径；未知值原样展示）。
@@ -341,7 +267,7 @@ mod tests {
         }
     }
 
-    // ---- ModInfo ↔ AppliedMod ↔ ModEntry 映射（ruling 4 的回归锚） ----
+    // ---- ModInfo ↔ AppliedMod 映射（ruling 4 的回归锚） ----
 
     #[test]
     fn applied_name_local_uses_title_steam_uses_dir_name() {
@@ -355,16 +281,6 @@ mod tests {
             applied_from_mod(&steam("1234567890")),
             AppliedMod::steam("1234567890")
         );
-    }
-
-    #[test]
-    fn pipe_entry_uses_dson_source_literal_as_version() {
-        let e = pipe_entry(&AppliedMod::local("X"));
-        assert_eq!(e.title, "X");
-        assert_eq!(e.version, "mod_local_source");
-        let e = pipe_entry(&AppliedMod::steam("42"));
-        assert_eq!(e.title, "42");
-        assert_eq!(e.version, "Steam");
     }
 
     // ---- 脏状态跟踪 ----
@@ -450,67 +366,11 @@ mod tests {
         assert_eq!(filter_indices(&mods, "9", &applied), Vec::<usize>::new());
     }
 
-    // ---- 热应用状态分类（ok 驱动，state verbatim） ----
+    // ---- B 路线文案 ----
 
     #[test]
-    fn classify_all_documented_states() {
-        // ok=true 一律成功（含 applied / applied-no-persist）。
-        assert_eq!(classify_hotapply(true, "applied"), HotapplyVerdict::Ok);
-        assert_eq!(
-            classify_hotapply(true, "applied-no-persist"),
-            HotapplyVerdict::Ok
-        );
-        // ok=false 的分支。
-        assert_eq!(
-            classify_hotapply(false, "game-not-running"),
-            HotapplyVerdict::OfflineFallback
-        );
-        assert_eq!(
-            classify_hotapply(false, "not-at-list"),
-            HotapplyVerdict::NotAtList
-        );
-        for s in [
-            "no-frame",
-            "apply-timeout",
-            "apply-exception",
-            "no-envelope-array",
-            "envelope-not-found:profile_x",
-            "bad-vector:0..7",
-            "bad-args",
-            "bad-cmd",
-            "engine-off:CreateRemoteThread failed",
-            "timeout",
-            "io-error",
-            "dll-not-found",
-            "bad-entry",
-        ] {
-            assert_eq!(
-                classify_hotapply(false, s),
-                HotapplyVerdict::Fail,
-                "state={s}"
-            );
-        }
-    }
-
-    #[test]
-    fn ok_and_fail_texts_match_old_tool_wording() {
-        assert_eq!(
-            hotapply_ok_text("applied"),
-            "✅已热应用。直接进入该存档即生效；再改请先退到存档列表。"
-        );
-        assert_eq!(
-            hotapply_ok_text("applied-no-persist"),
-            "✅已热应用（applied-no-persist）。"
-        );
-        assert_eq!(
-            hotapply_fail_text("timeout"),
-            "⚠️热应用失败（timeout），未修改任何内容；可重试，或关闭游戏后应用。"
-        );
-        assert_eq!(offline_fallback_text(None), "✅已写入存档（游戏未运行）。");
-        assert_eq!(
-            offline_fallback_text(Some("engine-off:no pipe")),
-            "✅已写入存档（游戏未运行，引擎未接入：engine-off:no pipe）。"
-        );
+    fn b_route_texts() {
+        assert_eq!(offline_fallback_text(), "✅已写入存档（游戏未运行）。");
         assert_eq!(
             file_only_ok_text(),
             "✅已写入存档（未开启热修改，改动在游戏下次读档时生效）。"
@@ -519,22 +379,6 @@ mod tests {
             file_only_game_running_text(),
             "⚠️已写入文件，但游戏正在运行——退出时游戏会覆盖本次修改，建议关闭游戏后再应用。"
         );
-    }
-
-    // ---- 净化 ----
-
-    #[test]
-    fn sanitize_replaces_control_chars_and_truncates_at_160() {
-        assert_eq!(sanitize_detail("ab\u{1}c"), "ab?c");
-        assert_eq!(sanitize_detail("del\u{7f}ete"), "del?ete");
-        let long = "字".repeat(200);
-        let out = sanitize_detail(&long);
-        assert_eq!(out.chars().count(), 161);
-        assert!(out.ends_with('…'));
-        let exact = "x".repeat(160);
-        assert_eq!(sanitize_detail(&exact).chars().count(), 160);
-        // 中文按字符截断，不切 UTF-8 字节。
-        assert!(sanitize_detail(&long).starts_with("字"));
     }
 
     // ---- game_mode 中文 ----

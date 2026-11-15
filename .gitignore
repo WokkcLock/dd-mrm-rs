@@ -2,6 +2,18 @@
 /dist
 /logs
 /.tech-tower
-/crates/hotapply/bin/
-.archify/
+/.rea/
 .dsh-ops/
+.archify/
+
+# hotapply DLL 正身入库；bin 下其他构建产物忽略
+/crates/hotapply/bin/*
+!/crates/hotapply/bin/DdHotapply.dll
+
+# native 中间产物不入库（正身由 build.ps1 直写 hotapply/bin）
+/native/*.obj
+/native/*.dll
+/native/*.map
+/native/*.lib
+/native/*.exp
+/native/*.pdb
