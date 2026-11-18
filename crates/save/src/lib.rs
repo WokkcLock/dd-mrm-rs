@@ -50,18 +50,17 @@
 //!
 //! ```no_run
 //! use std::path::Path;
-//! use save::{AppliedMod, ApplyOptions, apply_offline, discover_estates, scan_local_and_workshop};
+//! use save::{AppliedMod, apply_offline, discover_estates, scan_local_and_workshop};
 //!
 //! # fn main() -> save::Result<()> {
 //! // 1) 找档：save root 下含 persist.game.json 的子目录
 //! let estates = discover_estates(Path::new("C:/Saves"))?;
 //! // 2) 扫 mod：本地 + 工坊
 //! let report = scan_local_and_workshop(Path::new("C:/Mods"), Path::new("C:/workshop/content/262060"));
-//! // 3) 离线应用（可选先备份）
+//! // 3) 离线应用（备份由调用方先行，见 UI worker）
 //! let outcome = apply_offline(
 //!     &estates[0].persist_path,
 //!     &[AppliedMod::steam("1234567890")],
-//!     &ApplyOptions { backup_dir: Some("C:/Saves/SaveBak".into()) },
 //! )?;
 //! # let _ = (report, outcome);
 //! # Ok(())
@@ -77,7 +76,7 @@ pub mod paths;
 pub mod scan;
 
 pub use apply::{
-    APPLIED_FIELD_NAME, ApplyOptions, ApplyOutcome, DLC_FIELD_NAME, EstateFile, apply_offline,
+    APPLIED_FIELD_NAME, ApplyOutcome, DLC_FIELD_NAME, EstateFile, apply_offline,
     write_persist_atomic,
 };
 pub use backup::{backup_estate_dir, clean_old_backups};

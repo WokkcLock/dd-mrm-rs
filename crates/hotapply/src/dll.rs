@@ -5,9 +5,8 @@
 //!    （2、3 都是 exe 目录树内受管位：内容与嵌入副本不一致时自动覆盖为
 //!    嵌入版 —— 防旧部署/旧工具布局残留漂移，见 refresh_if_stale）
 //! 4. `crates/hotapply/bin/DdHotapply.dll`（native/build.ps1 的产物，开发态）
-//! 5. `<repo>/Gui/eng/native/DdHotapply.dll`（旧布局兼容，开发态）
-//! 6. 内嵌副本兜底：build.rs 在编译期把 DLL 嵌进 exe（见 build.rs），
-//!    前 5 项全未命中（部署机场景）时解压到 exe 目录；目录只读则退
+//! 5. 内嵌副本兜底：build.rs 在编译期把 DLL 嵌进 exe（见 build.rs），
+//!    前 4 项全未命中（部署机场景）时解压到 exe 目录；目录只读则退
 //!    `%TEMP%\DdModToolHotapply\`（与日志兜底同目录约定）。原子落位（GC4）。
 //!
 //! 全部未命中（且无内嵌）→ [`DllDiscoveryError`]，列出已搜索路径（任务要求）。
@@ -55,7 +54,7 @@ pub fn locate_dll() -> Result<PathBuf, DllDiscoveryError> {
         .and_then(|p| p.parent().map(Path::to_path_buf));
     // exe 目录树内的两个候选位（标准位 + eng/native 旧布局兼容位）都以嵌入
     // 副本为权威：内容漂移（旧部署/旧工具布局残留）→ 覆盖为嵌入版。env 覆
-    // 盖不校验（用户显式指定）；仓库内开发态候选（bin/、Gui/eng/native）是
+    // 盖不校验（用户显式指定）；仓库内开发态候选（bin/）是
     // build.rs 权威产物，自然一致。覆盖失败（目标被映射）→ 沿用旧文件。
     let managed_positions = exe_dir.as_ref().map(|d| {
         [
@@ -94,7 +93,7 @@ pub fn candidate_paths(
     exe_dir: Option<PathBuf>,
     manifest_dir: &Path,
 ) -> Vec<PathBuf> {
-    let mut v = Vec::with_capacity(5);
+    let mut v = Vec::with_capacity(4);
     if let Some(p) = env_override.filter(|s| !s.is_empty()) {
         v.push(PathBuf::from(p));
     }
@@ -102,17 +101,8 @@ pub fn candidate_paths(
         v.push(d.join(DLL_FILE_NAME));
         v.push(d.join("eng").join("native").join(DLL_FILE_NAME));
     }
-    // 开发态：仓库内提交的预编译副本 + native/build.ps1 产物目录
+    // 开发态：仓库内提交的预编译副本
     v.push(manifest_dir.join("bin").join(DLL_FILE_NAME));
-    v.push(
-        manifest_dir
-            .join("..")
-            .join("..")
-            .join("Gui")
-            .join("eng")
-            .join("native")
-            .join(DLL_FILE_NAME),
-    );
     v
 }
 
@@ -202,7 +192,7 @@ mod tests {
             Some(tmp.join("exe")),
             Path::new("/nonexistent-manifest"),
         );
-        assert_eq!(paths.len(), 5);
+        assert_eq!(paths.len(), 4);
         assert_eq!(paths[0], env_dll, "env override must be first");
         assert!(
             paths[0].is_file(),
@@ -235,15 +225,8 @@ mod tests {
         let bin_dll = touch(&manifest, &["bin", "DdHotapply.dll"]);
         // exe 目录无 DLL、无 env → manifest/bin 命中（无 env 时它是第 3 候选）
         let paths = candidate_paths(None, Some(tmp.join("exe")), &manifest);
-        assert_eq!(paths.len(), 4);
+        assert_eq!(paths.len(), 3);
         assert_eq!(paths[2], bin_dll);
-        // build.ps1 产物路径形态正确（<repo>/Gui/eng/native），排最后
-        // （含未折叠的 ..\..\ 组件，用后缀断言而非全路径相等）
-        assert!(
-            paths[3].ends_with(r"Gui\eng\native\DdHotapply.dll"),
-            "{}",
-            paths[3].display()
-        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -258,7 +241,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.starts_with("dll-not-found (searched:"), "{msg}");
         assert!(msg.contains("DdHotapply.dll"), "{msg}");
-        assert!(msg.matches("DdHotapply.dll").count() >= 4, "{msg}");
+        assert!(msg.matches("DdHotapply.dll").count() >= 3, "{msg}");
     }
 
     #[test]
@@ -268,7 +251,7 @@ mod tests {
             Some(PathBuf::from("/x")),
             Path::new("/m"),
         );
-        assert_eq!(paths.len(), 4, "空串 env 不进候选");
+        assert_eq!(paths.len(), 3, "空串 env 不进候选");
     }
 
     #[cfg(not(ddhotapply_placeholder))]

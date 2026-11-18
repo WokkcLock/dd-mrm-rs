@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! 注册表 SteamPath（HKCU → HKLM WOW64 → HKLM）→ Steam 主目录 steam
-//!   ├─ steam\userdata\<UID>\262060\remote          → 存档根（多账号取最近使用）
+//!   ├─ steam\userdata\<UID>\262060\remote          → 存档根（多账号按 UID 升序取第一）
 //!   └─ steam\steamapps\libraryfolders.vdf            → 库列表（缺失则仅主目录）
 //!        ├─ <库>\steamapps\common\DarkestDungeon    → 游戏目录 → <游戏>\mods
 //!        └─ <库>\steamapps\workshop\content\262060 → 工坊根（缺失按游戏库预测）
@@ -19,7 +19,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Darkest Dungeon 的 Steam AppId（userdata 与工坊 content 下的目录名）。
 pub const DD_APP_ID: &str = "262060";
@@ -31,7 +30,7 @@ const DD_GAME_DIR: &str = "DarkestDungeon";
 pub struct Detected {
     /// 存档根（`userdata\<UID>\262060\remote`）；多账号时 = `save_root_candidates[0]`。
     pub save_root: Option<PathBuf>,
-    /// 所有命中账号的存档根，最近使用在前（单账号时长度 1）。
+    /// 所有命中账号的存档根，UID 升序（单账号时长度 1）。
     pub save_root_candidates: Vec<PathBuf>,
     /// 本地 mods 目录（游戏目录下的 `mods`）。
     pub local_mods_dir: Option<PathBuf>,
@@ -99,11 +98,12 @@ pub fn detect_from(steam: &Path) -> Detected {
     d
 }
 
-/// 存档根：userdata 下所有「有 262060 目录」的账号，按最近使用排序取第一。
+/// 存档根：userdata 下所有「有 262060 目录」的账号，按 UID 升序取第一
+/// （profile_0,1,2… 式自然序，不猜最近使用）。
 /// Steam 的 userdata 只在主安装目录（不在各库），这正是手动配置最易错的一点。
 fn detect_save_root(steam: &Path, d: &mut Detected) {
     let userdata = steam.join("userdata");
-    let mut accounts: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut accounts: Vec<(u64, PathBuf)> = Vec::new();
     match fs::read_dir(&userdata) {
         Ok(entries) => {
             for entry in entries.flatten() {
@@ -115,13 +115,7 @@ fn detect_save_root(steam: &Path, d: &mut Detected) {
                 if !app_dir.is_dir() {
                     continue;
                 }
-                let remote = app_dir.join("remote");
-                let recency = if remote.is_dir() {
-                    dir_mtime(&remote)
-                } else {
-                    dir_mtime(&app_dir)
-                };
-                accounts.push((recency, uid.parse().unwrap_or(u64::MAX), remote));
+                accounts.push((uid.parse().unwrap_or(u64::MAX), app_dir.join("remote")));
             }
         }
         Err(_) => {
@@ -139,15 +133,15 @@ fn detect_save_root(steam: &Path, d: &mut Detected) {
         );
         return;
     }
-    // 最近使用在前；同时长按 UID 升序（确定性，多账号提示文案依赖稳定顺序）。
-    accounts.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // UID 升序（确定性，多账号提示文案依赖稳定顺序）。
+    accounts.sort_by_key(|(uid, _)| *uid);
     if accounts.len() > 1 {
         d.notes.push(format!(
-            "存档取最近使用的账号（UID {}）",
-            accounts[0].1
+            "检测到多个 Steam 账号，已取 UID 最小的一个（UID {}）",
+            accounts[0].0
         ));
     }
-    d.save_root_candidates = accounts.iter().map(|(_, _, p)| p.clone()).collect();
+    d.save_root_candidates = accounts.iter().map(|(_, p)| p.clone()).collect();
     d.save_root = d.save_root_candidates.first().cloned();
 }
 
@@ -235,11 +229,6 @@ fn workshop_content(lib: &Path) -> PathBuf {
         .join(DD_APP_ID)
 }
 
-fn dir_mtime(p: &Path) -> SystemTime {
-    fs::metadata(p)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
 
 /// 极简 VDF 词法：抽取所有成对带引号的字符串 token；key == "path" 时
 /// 下一个 token 即库路径。库 vdf 结构简单且无同名歧义，不值得引依赖。

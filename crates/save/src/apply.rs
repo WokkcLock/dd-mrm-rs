@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use dson::{DsonDoc, FieldValue, NewNode, NewValue, NodeId};
 
-use crate::backup::backup_estate_dir;
 use crate::error::{Result, SaveError};
 use crate::mod_model::{AppliedMod, DlcEntry, ModSource};
 use crate::paths::validate_persist_path;
@@ -321,111 +320,41 @@ pub(crate) fn atomic_write_raw(path: &Path, bytes: &[u8]) -> Result<()> {
     Err(SaveError::io(path, err))
 }
 
-/// `apply_offline` 的可选项。
-#[derive(Debug, Clone, Default)]
-pub struct ApplyOptions {
-    /// 写入前对整个 estate 目录做 zip 备份的目标目录（None = 不备份）。
-    pub backup_dir: Option<PathBuf>,
-}
-
 /// 一次离线应用的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
-    /// 备份与日志用的 estate 标签（estatename，缺失时用目录名）。
-    pub estate_label: String,
     /// 被写入的 persist 文件路径。
     pub persist_path: PathBuf,
-    /// 生成的备份 zip（未启用备份 → None）。
-    pub backup_zip: Option<PathBuf>,
     /// 应用后的 mod 数。
     pub mod_count: usize,
     /// 写出字节数。
     pub bytes_written: usize,
 }
 
-/// 离线应用（旧 CoverSave = 备份 + SyncMod + 写出）：
+/// 离线应用（旧 CoverSave 的 SyncMod + 写出；备份由调用方先行——UI worker
+/// 要在备份失败时弹「重试/跳过/取消」，故备份不内嵌在此）：
 ///
 /// 1. 白名单校验 + 解析存档；
-/// 2. 若给了 `backup_dir`，**先**对 estate 目录整体 zip 备份；
-/// 3. `sync_mods` 重写 applied 列表；
-/// 4. 原子写回。
-///
-/// 失败于任一步则不落盘（备份已生成时不回滚——它只是多了一份备份）。
-pub fn apply_offline(
-    persist_path: &Path,
-    mods: &[AppliedMod],
-    opts: &ApplyOptions,
-) -> Result<ApplyOutcome> {
+/// 2. `sync_mods` 重写 applied 列表；
+/// 3. 原子写回。失败于任一步则不落盘。
+pub fn apply_offline(persist_path: &Path, mods: &[AppliedMod]) -> Result<ApplyOutcome> {
     validate_persist_path(persist_path)?;
     let mut file = EstateFile::open(persist_path)?;
-
-    let estate_dir = persist_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let label = backup_label(&file, &estate_dir);
-
-    let backup_zip = match &opts.backup_dir {
-        Some(dir) => Some(backup_estate_dir(&estate_dir, &label, dir)?),
-        None => None,
-    };
 
     file.sync_mods(mods)?;
     let bytes = file.to_bytes()?;
     write_persist_atomic(persist_path, &bytes)?;
 
     Ok(ApplyOutcome {
-        estate_label: label,
         persist_path: persist_path.to_path_buf(),
-        backup_zip,
         mod_count: mods.len(),
         bytes_written: bytes.len(),
     })
 }
 
-/// 备份标签：优先 estatename（消毒为文件系统安全字符），缺失/为空回退目录名。
-fn backup_label(file: &EstateFile, estate_dir: &Path) -> String {
-    let raw = file
-        .estate_name()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(sanitize_filename)
-        .unwrap_or_default();
-    if raw.is_empty() {
-        estate_dir
-            .file_name()
-            .map(|n| sanitize_filename(&n.to_string_lossy()))
-            .unwrap_or_else(|| "estate".to_owned())
-    } else {
-        raw
-    }
-}
-
-/// 把 Windows 文件名非法字符与控制字符替换为 `_`。
-fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_replaces_invalid_chars() {
-        assert_eq!(
-            sanitize_filename(r#"a<b>c:"d/e\f|g?h*i"#),
-            "a_b_c__d_e_f_g_h_i"
-        );
-        assert_eq!(sanitize_filename("干净名字"), "干净名字");
-        assert_eq!(sanitize_filename("ctrl\u{7}x"), "ctrl_x");
-    }
 
     #[test]
     fn tmp_path_is_append_not_replace_extension() {

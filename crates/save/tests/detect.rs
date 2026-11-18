@@ -5,8 +5,6 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::Duration;
 
 use common::TempGuard;
 use save::detect::detect_from;
@@ -55,9 +53,7 @@ fn full_layout_two_accounts_two_libraries() {
     let lib2 = g.path("lib2");
     mkdirs(&steam);
 
-    // 账号 111（旧）先建，睡 15ms 再建 222（新）→ 222 = 最近使用。
     let r111 = account_remote(&steam, "111");
-    thread::sleep(Duration::from_millis(15));
     let r222 = account_remote(&steam, "222");
 
     // 游戏在主库（vdf 0 号 = 主目录），工坊在第二库。
@@ -73,11 +69,11 @@ fn full_layout_two_accounts_two_libraries() {
     write_vdf(&steam, &[steam.clone(), lib2.clone()]);
 
     let d = detect_from(&steam);
-    assert_eq!(d.save_root, Some(r222.clone()));
-    assert_eq!(d.save_root_candidates, vec![r222, r111]);
+    assert_eq!(d.save_root, Some(r111.clone()));
+    assert_eq!(d.save_root_candidates, vec![r111, r222]);
     assert_eq!(d.local_mods_dir, Some(game.join("mods")));
     assert_eq!(d.workshop_dir, Some(ws2.parent().unwrap().to_path_buf()));
-    assert!(d.notes.iter().any(|n| n.contains("存档取最近使用的账号（UID 222）")), "notes: {d:?}");
+    assert!(d.notes.iter().any(|n| n.contains("已取 UID 最小的一个（UID 111）")), "notes: {d:?}");
 }
 
 #[test]

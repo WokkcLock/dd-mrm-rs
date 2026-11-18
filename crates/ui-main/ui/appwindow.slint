@@ -1416,6 +1416,16 @@ export component AppWindow inherits Window {
                     border-color: Palette.border;
                     border-radius: 4px;
 
+                    // 空态提示：删光预设后管理弹窗、无预设时应用弹窗不再是一片空白
+                    if root.preset-model.length == 0 : Text {
+                        text: "暂无预设；先用「保存预设」存一个。";
+                        color: Palette.foreground;
+                        opacity: 0.55;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+
                     ListView {
                         for item[index] in root.preset-model : Rectangle {
                             height: 40px;

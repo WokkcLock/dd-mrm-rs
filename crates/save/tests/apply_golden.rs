@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use common::TempGuard;
-use save::{AppliedMod, ApplyOptions, EstateFile, SaveError, apply_offline, write_persist_atomic};
+use save::{AppliedMod, EstateFile, SaveError, apply_offline, write_persist_atomic};
 
 /// goldens 位于**工作区根** tests/golden/（crate 目录的上两级）。
 fn manifest_dir() -> PathBuf {
@@ -163,7 +163,7 @@ fn game_written_roundtrip_and_sync_same() {
 fn clear_then_readd_roundtrip() {
     let (_guard, persist) = stage_golden("rt", PROFILE_7);
     let m = AppliedMod::local("重生之我是测试");
-    apply_offline(&persist, &[], &ApplyOptions::default()).unwrap();
+    apply_offline(&persist, &[]).unwrap();
     assert!(
         EstateFile::open(&persist)
             .unwrap()
@@ -172,7 +172,7 @@ fn clear_then_readd_roundtrip() {
             .is_empty()
     );
 
-    apply_offline(&persist, std::slice::from_ref(&m), &ApplyOptions::default()).unwrap();
+    apply_offline(&persist, std::slice::from_ref(&m)).unwrap();
     assert_eq!(
         EstateFile::open(&persist).unwrap().applied_mods().unwrap(),
         vec![m.clone()],
@@ -198,7 +198,7 @@ fn whitelist_rejects_non_persist_targets() {
         Err(SaveError::Whitelist { .. })
     ));
     assert!(matches!(
-        apply_offline(&bad, &[], &ApplyOptions::default()),
+        apply_offline(&bad, &[]),
         Err(SaveError::Whitelist { .. })
     ));
 
@@ -227,51 +227,6 @@ fn whitelist_rejects_non_persist_targets() {
         EstateFile::open(&dir.join("persist.game.json")),
         Err(SaveError::Io { .. })
     ));
-}
-
-/// apply_offline 带备份目录：备份 zip 先于写盘生成，写后内容正确。
-#[test]
-fn apply_offline_with_backup() {
-    let guard = TempGuard::new("ab");
-    let estate = guard.path("estate_7");
-    fs::create_dir_all(&estate).unwrap();
-    let persist = estate.join("persist.game.json");
-    fs::write(&persist, golden(PROFILE_7)).unwrap();
-    fs::write(estate.join("extra.bin"), "estate 内其它文件".as_bytes()).unwrap();
-    let backup_dir = guard.path("SaveBak");
-
-    let mods = EstateFile::open(&persist).unwrap().applied_mods().unwrap();
-    let outcome = apply_offline(
-        &persist,
-        &mods,
-        &ApplyOptions {
-            backup_dir: Some(backup_dir.clone()),
-        },
-    )
-    .unwrap();
-
-    let zip = outcome.backup_zip.as_ref().expect("应生成备份");
-    assert!(zip.starts_with(&backup_dir), "备份必须落在调用方目录内");
-    assert_eq!(zip.extension().and_then(|e| e.to_str()), Some("zip"));
-    // 备份名 = {label}_{yyyy-MM-dd-HH-mm-ss}.zip
-    let stem = zip.file_stem().and_then(|s| s.to_str()).unwrap();
-    let (label, stamp) = stem.rsplit_once('_').expect("备份名应含时间戳段");
-    assert_eq!(label, outcome.estate_label);
-    assert_eq!(
-        stamp.split('-').count(),
-        6,
-        "时间戳应为 yyyy-MM-dd-HH-mm-ss 六段: {stamp}"
-    );
-    assert!(stamp.chars().all(|c| c.is_ascii_digit() || c == '-'));
-    assert!(!fs::read(&persist).unwrap().is_empty());
-    assert_eq!(
-        EstateFile::open(&persist)
-            .unwrap()
-            .applied_mods()
-            .unwrap()
-            .len(),
-        9
-    );
 }
 
 /// DLC 权属列表（FR1 读侧）：三份金样本的 `base_root.dlc` 实测内容。

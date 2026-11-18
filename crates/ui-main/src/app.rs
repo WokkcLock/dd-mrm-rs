@@ -14,7 +14,7 @@ use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString,
 
 use hotapply::{ensure_hooked, game_running};
 use save::{
-    AppliedMod, ApplyOptions, Estate, EstateFile, ModInfo, ModSource, Presets, SaveError,
+    AppliedMod, Estate, EstateFile, ModInfo, ModSource, Presets, SaveError,
     SaveRoots, apply_offline, backup_estate_dir, clean_old_backups, detect_roots, discover_estates,
     scan_mod_dir,
 };
@@ -2303,7 +2303,7 @@ fn apply_worker(
     // size 缓存）——写盘前重查进程，已启动同样走挂守卫路径。
     let hot_path = hotapply && (running || game_running());
     if !hot_path {
-        let r = apply_offline(&persist, &mods, &ApplyOptions { backup_dir: None });
+        let r = apply_offline(&persist, &mods);
         let text = if hotapply {
             offline_fallback_text()
         } else if running {
@@ -2330,7 +2330,7 @@ fn apply_worker(
     }
     // 守卫已挂：离线原子写盘 + 仪式指引（重看开场动画触发 refresh，守卫在
     // size 查询处对齐磁盘真值，游戏读到新内容）。
-    let r = apply_offline(&persist, &mods, &ApplyOptions { backup_dir: None });
+    let r = apply_offline(&persist, &mods);
     let text = hotapply_ritual_text();
     finish_apply(weak, st2, estate_idx, offline_msg(r, text));
 }
