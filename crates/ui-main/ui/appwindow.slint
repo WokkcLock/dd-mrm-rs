@@ -144,7 +144,7 @@ component PaperButton inherits Rectangle {
     }
 }
 
-// 存档行（紧凑 32px）：名字 + 右侧模组数；选中 = 左缘 3px 主红 + 选中底。
+// 存档行（紧凑 32px）：名字 + 右侧模组数；选中 = 选中底色（无指示条——长名会遮挡文字）。
 component EstateRow inherits Rectangle {
     in property <EstateItem> item;
     in property <bool> current;
@@ -153,11 +153,6 @@ component EstateRow inherits Rectangle {
     background: root.current
         ? Palette.selection-background
         : (ta.has-hover ? Palette.alternate-background : transparent);
-    if root.current : Rectangle {
-        width: 3px;
-        height: 100%;
-        background: Palette.accent-background;
-    }
     ta := TouchArea {
         clicked => { root.clicked(); }
     }
