@@ -6,9 +6,10 @@
 //! - 本 crate 唯一可写的存档目标是 estate 目录内的 `persist.game.json`：
 //!   一切写入口径都过 [`validate_persist_path`] 白名单；
 //! - 写入一律走 `.tmp` + rename 原子替换（[`write_persist_atomic`]）；
-//! - 三根目录（save root / 本地 mods / 工坊）全部由调用方传入，
-//!   本 crate **不做** Steam 自动发现；也从不写调用方目录之外的地方
-//!   （备份目录、配置文件路径同样由调用方指定）。
+//! - 三根目录（save root / 本地 mods / 工坊）常规来源是调用方传入；
+//!   另提供只读的自动探测 [`detect_roots`]（注册表 + 文件系统，探测失败
+//!   只返回提示、绝不落盘），手动配置始终兜底。也从不写调用方目录之外
+//!   的地方（备份目录、配置文件路径同样由调用方指定）。
 //!
 //! # 自有 JSON 文件格式（重写后的新格式，与旧 C# 不兼容）
 //!
@@ -69,6 +70,7 @@
 
 pub mod apply;
 pub mod backup;
+pub mod detect;
 pub mod error;
 pub mod mod_model;
 pub mod paths;
@@ -79,6 +81,7 @@ pub use apply::{
     write_persist_atomic,
 };
 pub use backup::{backup_estate_dir, clean_old_backups};
+pub use detect::{Detected, detect_roots};
 pub use error::{Result, SaveError};
 pub use mod_model::{AppliedMod, DlcEntry, ModInfo, ModSource};
 pub use paths::{

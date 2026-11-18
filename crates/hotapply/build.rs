@@ -24,6 +24,10 @@ fn main() {
     let bin_dll = manifest.join("bin").join("DdHotapply.dll");
     let out_dll = PathBuf::from(env::var("OUT_DIR").unwrap()).join("DdHotapply.dll");
 
+    // dll.rs 的 #[cfg(ddhotapply_placeholder)] 需要 check-cfg 声明，
+    // 否则 DLL 正常存在（cfg 未设置）时 unexpected_cfgs 误报。
+    println!("cargo:rustc-check-cfg=cfg(ddhotapply_placeholder)");
+
     for p in [
         native.join("DdHotapply.c"),
         native.join("thunk64.asm"),

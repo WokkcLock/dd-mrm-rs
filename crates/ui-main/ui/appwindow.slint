@@ -6,11 +6,13 @@
 // 交互约定不变：拖拽排序/跨列表插入（插入线+幽灵）、双击加/移、Ctrl+↑↓、回车/Delete、
 //   行尾图标钮开目录、Esc=对话末位按钮。显示字符串一律 Rust 组装（slint 哑渲染）。
 //
-// 主题（design-spec 配色表）：声明自己的 Palette 全局覆盖 std-widgets 默认（暖纸），
-// std-widgets 内部控件读取的 Palette 解析到这份声明。字面量仅用于 spec 独有语义色：
+// 主题（design-spec 配色表）：Palette 全局 = 暖纸色板，仅供本文件自绘组件取色；
+// std-widgets（fluent）读样式库自己的 Palette，随系统深浅色——系统深色时 LineEdit
+// 白字画在纸底上不可见（设置面板路径文字 bug 根因），故 AppWindow init 强制其
+// color-scheme = light，全库控件走 fluent-light。字面量仅用于 spec 独有语义色：
 //   警示 #f2e4cf/#c9922a/#7a5a10、强调名 #6a1815、链接 #8a2420/#6a1815。
 
-import { Button, LineEdit, CheckBox, ListView } from "std-widgets.slint";
+import { Button, LineEdit, CheckBox, ListView, Palette as StdPalette } from "std-widgets.slint";
 export global Palette {
     in property <color> background: #f5efe2;
     in property <color> foreground: #2a2520;
@@ -513,6 +515,9 @@ export component AppWindow inherits Window {
     max-height: 4096px;
     background: Palette.background;
     forward-focus: fs-estates;
+    // std-widgets（fluent）配色强制浅色：默认随系统深浅色，深色模式下 LineEdit 文字为白、
+    // 控件底为 6% 白透明，画在暖纸主题上等于隐形。与本文件自绘 Palette（暖纸）互不相干。
+    init => { StdPalette.color-scheme = ColorScheme.light; }
 
     // ---- 模型 ----
     in property <[EstateItem]> estate-model;
@@ -580,6 +585,8 @@ export component AppWindow inherits Window {
     in-out property <bool> cfg-hotapply: true;
     in-out property <string> cfg-local-mods;
     in-out property <string> cfg-workshop;
+    // 自动探测结果提示（设置面板内展示；空串=不显示）。
+    in-out property <string> detect-hint;
 
     // ---- 回调 ----
     callback estate-selected(int);      // 单击/回车：请求切换档（脏则 Rust 先确认）
@@ -597,6 +604,7 @@ export component AppWindow inherits Window {
         root.drag-ghost-x = px * 1px;
         root.drag-ghost-y = py * 1px;
     }
+    callback auto-detect();                  // 设置面板「自动探测」：注册表+文件系统探测三根
     callback open-mod-dir(string);           // 打开 mod 目录（资源管理器）
     callback rescan-clicked();
     callback apply-clicked();
@@ -1268,7 +1276,7 @@ export component AppWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 560px;
-            height: root.dlg-kind == 5 ? 420px
+            height: root.dlg-kind == 5 ? (root.detect-hint == "" ? 420px : 465px)
                 : ((root.dlg-kind == 4 || root.dlg-kind == 8
                     || (root.dlg-kind == 3 && root.dlg-title == "保存预设")) ? 420px
                     : (root.dlg-kind == 7 ? 480px : 250px));
@@ -1538,6 +1546,21 @@ export component AppWindow inherits Window {
                         path <=> root.cfg-workshop;
                         browse => { root.browse-dir(2); }
                         open => { root.open-dir(2); }
+                    }
+                    // 自动探测：一键填三根（探测不到的项不动原值）。结果提示独占一行：
+                    // 与热修改说明同款「整行宽 + word-wrap」，行高随文案换行自动增高，不截断。
+                    HorizontalLayout {
+                        PaperButton {
+                            label: "自动探测";
+                            clicked => { root.auto-detect(); }
+                        }
+                    }
+                    if root.detect-hint != "" : Text {
+                        text: root.detect-hint;
+                        font-size: 13px;
+                        color: Palette.foreground;
+                        opacity: 0.9;
+                        wrap: word-wrap;
                     }
 
                     SettingsSection { name: "热修改"; }

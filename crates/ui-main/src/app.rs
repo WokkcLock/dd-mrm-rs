@@ -15,7 +15,8 @@ use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, SharedString,
 use hotapply::{ensure_hooked, game_running};
 use save::{
     AppliedMod, ApplyOptions, Estate, EstateFile, ModInfo, ModSource, Presets, SaveError,
-    SaveRoots, apply_offline, backup_estate_dir, clean_old_backups, discover_estates, scan_mod_dir,
+    SaveRoots, apply_offline, backup_estate_dir, clean_old_backups, detect_roots, discover_estates,
+    scan_mod_dir,
 };
 
 use crate::model::{
@@ -159,6 +160,7 @@ enum ApplyMsg {
 pub fn run() {
     let app = AppWindow::new().expect("窗口创建失败");
     clamp_init_size(&app);
+    pin_light_titlebar();
     let exe = model::exe_dir();
     let cfg_path = exe.join(CFG_FILE_NAME);
     let savebak = exe.join(BACKUP_DIR_NAME);
@@ -275,6 +277,72 @@ fn clamp_init_size(app: &AppWindow) {
     app.set_init_width(1280.0_f32.min(avail_w * 0.9));
     app.set_init_height(860.0_f32.min(avail_h * 0.9));
 }
+
+/// 原生标题栏钉浅色：Windows 深色「应用模式」会把 winit 窗口标题栏画成黑条，
+/// 与暖纸 UI 拼接突兀。slint 1.18 的 winit 后端在非 xdg 平台从不调 set_theme
+/// （winitwindowadapter.rs:654 else 分支只回读系统值），所以 core 里钉浅色
+/// 管不到标题栏，只能自己设 DWMWA_USE_IMMERSIVE_DARK_MODE = FALSE。
+/// 窗口要在 run() 事件循环里才创建，因此用 slint 定时器短轮询等它出现；
+/// 该属性随窗口生命周期有效，设一次即止，浅色机上等于把系统值钉回浅色（无感）。
+#[cfg(windows)]
+fn pin_light_titlebar() {
+    use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+    static PID: AtomicU32 = AtomicU32::new(0);
+    PID.store(std::process::id(), Ordering::SeqCst);
+
+    extern "system" fn find_ours(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid != PID.load(Ordering::SeqCst) || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return 1;
+        }
+        let mut buf = [0u16; 32];
+        let len = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), 32) };
+        let title = String::from_utf16_lossy(&buf[..(len as usize).min(32)]);
+        if title.starts_with("dd-mrm") {
+            FOUND.store(hwnd as isize, Ordering::SeqCst);
+            0 // 找到即停止枚举
+        } else {
+            1
+        }
+    }
+
+    fn tick() {
+        let mut hwnd = FOUND.load(Ordering::SeqCst) as isize as HWND;
+        if hwnd.is_null() {
+            unsafe { EnumWindows(Some(find_ours), 0) };
+            hwnd = FOUND.load(Ordering::SeqCst) as isize as HWND;
+        }
+        if !hwnd.is_null() {
+            let light: BOOL = 0; // FALSE = 浅色标题栏
+            unsafe {
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                    &light as *const BOOL as *const core::ffi::c_void,
+                    std::mem::size_of::<BOOL>() as u32,
+                );
+            }
+            return;
+        }
+        // 事件循环起来后窗口才可见；约 10s 兜底，超时放弃（保持系统原样，无害）。
+        static TRIES: AtomicU32 = AtomicU32::new(0);
+        if TRIES.fetch_add(1, Ordering::SeqCst) < 33 {
+            slint::Timer::single_shot(Duration::from_millis(300), tick);
+        }
+    }
+    slint::Timer::single_shot(Duration::from_millis(300), tick);
+}
+
+#[cfg(not(windows))]
+fn pin_light_titlebar() {}
 
 // ============================================================ 回调接线
 
@@ -530,6 +598,7 @@ fn wire_callbacks(app: &AppWindow, st: &State) {
             app.set_cfg_local_mods(path_text(lm).into());
             app.set_cfg_workshop(path_text(ws).into());
             app.set_cfg_hotapply(ha);
+            app.set_detect_hint("".into()); // 每次打开设置重置探测提示
             open_dialog(
                 &app,
                 &st,
@@ -675,7 +744,17 @@ fn wire_callbacks(app: &AppWindow, st: &State) {
         let weak = app.as_weak();
         app.on_browse_dir(move |which| {
             let app = weak.unwrap();
-            if let Some(p) = rfd::FileDialog::new().set_title("选择目录").pick_folder() {
+            let cur = match which {
+                0 => app.get_cfg_save_root().to_string(),
+                1 => app.get_cfg_local_mods().to_string(),
+                _ => app.get_cfg_workshop().to_string(),
+            };
+            let mut dlg = rfd::FileDialog::new().set_title("选择目录");
+            // 起点 = 当前输入路径；不存在则向上找最近存在的祖先；空/全无效 = 默认位置。
+            if let Some(start) = nearest_existing_dir(std::path::Path::new(cur.trim())) {
+                dlg = dlg.set_directory(start);
+            }
+            if let Some(p) = dlg.pick_folder() {
                 let t = p.display().to_string();
                 match which {
                     0 => app.set_cfg_save_root(t.into()),
@@ -683,6 +762,45 @@ fn wire_callbacks(app: &AppWindow, st: &State) {
                     _ => app.set_cfg_workshop(t.into()),
                 }
             }
+        });
+    }
+    // ---- 设置：自动探测三根（注册表 → userdata/库遍历，见 save::detect）----
+    {
+        let weak = app.as_weak();
+        app.on_auto_detect(move || {
+            let app = weak.unwrap();
+            let d = detect_roots();
+            if let Some(p) = &d.save_root {
+                app.set_cfg_save_root(p.display().to_string().into());
+            }
+            if let Some(p) = &d.local_mods_dir {
+                app.set_cfg_local_mods(p.display().to_string().into());
+            }
+            if let Some(p) = &d.workshop_dir {
+                app.set_cfg_workshop(p.display().to_string().into());
+            }
+            let filled = d.save_root.is_some() as usize
+                + d.local_mods_dir.is_some() as usize
+                + d.workshop_dir.is_some() as usize;
+            let mut hint = match filled {
+                3 => "已自动填入三项".to_string(),
+                0 => "未探测到 Steam 路径，已保留原值，请手动填写".to_string(),
+                n => format!("已自动填入 {n}/3 项，其余保留原值"),
+            };
+            for n in &d.notes {
+                hint.push_str("；");
+                hint.push_str(n);
+            }
+            if filled > 0 {
+                if !hint.ends_with('。') {
+                    hint.push('。');
+                }
+                hint.push_str("确认后「保存并重扫」生效。");
+            } else if !hint.ends_with('。') {
+                hint.push('。');
+            }
+            app.set_detect_hint(hint.into());
+            set_status(&app, "自动探测完成（详见设置内提示）。", 0);
         });
     }
     {
@@ -2031,6 +2149,18 @@ fn load_preset_now(app: &AppWindow, st: &State, name: &str) {
     } else {
         set_status(app, &format!("已载入预设「{name}」。"), 3);
     }
+}
+
+/// 浏览对话框起点：路径本身是目录 → 用它；否则向上找最近存在的祖先目录；全无效 → None。
+fn nearest_existing_dir(p: &std::path::Path) -> Option<PathBuf> {
+    let mut cur = Some(p);
+    while let Some(p) = cur {
+        if p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+        cur = p.parent();
+    }
+    None
 }
 
 fn apply_settings(app: &AppWindow, st: &State) {

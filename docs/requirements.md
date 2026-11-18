@@ -21,9 +21,10 @@ Darkest Dungeon 存档 mod 管理器：离线改档 + 游戏运行中热修改�
 | FR8 | 备份 | 应用前自动备份为 zip（SaveBak/{档名}_{时间戳}.zip，可手工解压恢复——与旧工具一致，无内置恢复 UI） |
 | FR9 | 状态栏 | 应用结果四态反馈 + 失败细节（净化后展示） |
 | FR10 | dsoncli | 编解码 CLI：parse/dump/rewrite/roundtrip（dd-mrm-dson 双 target） |
+| FR11 | 三根自动探测 | 设置面板「自动探测」：注册表 SteamPath → userdata 多账号（取最近使用+提示）/ libraryfolders.vdf 多库 → 填入三根；探测不到的项不动原值，手动流程兜底（2026-11-17） |
 
 不做（Non-goals）：frida 引擎路线；战役内（镇/raid）修改；hero 等 17 存档文件的
-编辑（类型白名单外，见 dson-bit31-notes.md §5）；自动发现 Steam 安装（首版配置
+编辑（类型白名单外，见 dson-bit31-notes.md §5）；首跑强制配置向导（三根自动探测见 FR11，手动兜底；首版配置
 文件写死路径）。
 
 ## 3. 非功能需求

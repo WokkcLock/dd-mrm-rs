@@ -42,7 +42,7 @@ cargo run -p dson -- roundtrip <in.dson>  # 解析→重写→字节比对，报
 | crate | 职责 |
 |---|---|
 | dson        | DSON 二进制编解码（bit31 保真、字节级往返），lib + dsoncli |
-| save        | 档发现 / mod 扫描 / 离线应用 / zip 备份（白名单 persist.game.json） |
+| save        | 档发现 / mod 扫描 / 离线应用 / zip 备份 / 三根自动探测（白名单 persist.game.json） |
 | hotapply    | 注入器 + size 守卫部署（locate/hook/injector）；参数权威 = `native/DdHotapply.c` |
 | ui-main     | slint GUI（中文），产品二进制 |
 
