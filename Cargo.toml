@@ -8,9 +8,10 @@ members = [
     "crates/xtask",
 ]
 
-# 体积收窄：strip 符号 + thin LTO + 单 codegen 单元。
+# 体积收窄：strip 符号 + fat LTO + 单 codegen 单元 + 体积优先优化档（opt-level=s）。
 # 注意：不用 panic="abort"——app.rs 依赖 catch_unwind 兜底恢复 UI。
 [profile.release]
 strip = true
-lto = "thin"
+opt-level = "s"
+lto = "fat"
 codegen-units = 1

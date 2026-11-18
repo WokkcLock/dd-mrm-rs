@@ -9,7 +9,8 @@ description = "dd-mrm: slint-based Darkest Dungeon mod manager GUI"
 save = { path = "../save" }
 hotapply = { path = "../hotapply" }
 # slint 1.x 稳定线（许可决定留给发布期，见任务 5 报告）。
-slint = "1.18.1"
+# 渲染器选 software（CPU）：比 femtovg（OpenGL）省数 MB 体积，模组管理器 UI 无动画重负载。
+slint = { version = "1.18.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2", "accessibility"] }
 # 配置文件 dd-mrm.json 序列化（roots + presets_path 包裹层）。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
